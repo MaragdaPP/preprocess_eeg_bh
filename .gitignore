@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+
+output/
+participantes_eeg_bh/
+
+*.fif
+*.eeg
+*.vhdr
+*.vmrk
+
+*.xlsx
+*.png
+*.json
+*.log
