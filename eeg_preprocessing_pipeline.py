@@ -3,8 +3,8 @@
 EEG Pre-processing Pipeline for BrainVision (32-electrode) Data
 ================================================================
 Experiment: Interoception / Breath-Hold study
-Segments  : LB (baseline), BH 1-4, Recov (recovery)
-Output    : Spectral band-power Excel files at window, segment, and region levels
+Segments  : LB (baseline), BH 1-4, CPT (full duration), Recov (recovery)
+Output    : Cleaned EEG .fif files plus QC summaries for downstream analysis
 
 This script is organised in VSCode-style cells (#%%).
 Cell 1 contains ALL imports, configuration, and function definitions.
@@ -13,28 +13,12 @@ Subsequent cells follow an interactive inspect-first workflow:
   Cell 1 — Imports, config, ALL function definitions
   Cell 2 — Load raw + list annotations + segment inspection  (BREAKPOINT)
   Cell 3 — Visualize RAW signal segment by segment
-  Cell 4 — Preprocessing (Steps 1-7)
+  Cell 4 — Preprocessing (Steps 1–8)
+  Optional — ICA component viewer (LB segment only; read-only QC)
   Cell 5 — Visualize CLEANED signal segment by segment
-  Cell 6 — Spectral power computation (all segments)
-  Cell 7 — Aggregation & Excel export
+  Cell 6 — Preprocessing summary + save cleaned data
+  Downstream spectral analysis lives in ``eeg_spectral_analysis.py``
 
-Author : auto-generated pipeline
-Date   : 2026-02-09
-
-EXECUTION SCHEDULE (per subject):
-=================================
-1. Cell 1  - Run once per session (loads functions)
-2. Cell 2  - Edit SUJETO and EEG_FILE, then run
-3. Cells 3a-3d - Inspect raw data, mark BAD sections
-4. Cell 4  - Run preprocessing (takes 2-5 min for ICA)
-5. Cells 5a-5c - Inspect cleaned data, mark residual artifacts
-6. Cell 6  - Review summary, save cleaned data
-7. Cell 7  - Compute spectral power
-8. Cell 8  - Export per-subject Excel
-9. Cell 10 - Generate topomaps (optional)
-
-After all subjects:
-10. Cell 9 - Aggregate all subjects into global Excel
 """
 
 #%%
@@ -86,7 +70,6 @@ INPUT_DIR  = BASE_DIR / "participantes_eeg_bh"
 OUTPUT_DIR = BASE_DIR / "output"
 FIF_DIR    = OUTPUT_DIR / "fif_steps"
 QC_DIR     = OUTPUT_DIR / "qc"
-EXCEL_DIR  = OUTPUT_DIR / "excels"
 
 # --- Subject list ---------------------------------------------------------
 # Set to None for auto-discovery, or e.g. [3, 4, 5] for a manual subset.
@@ -99,27 +82,15 @@ EXPECTED_CHANNELS: List[str] = [
     "CP6", "CP2", "Cz", "C4", "T8", "FT10", "FC6", "FC2", "F4", "F8",
     "Fp2",
 ]
-EOG_CHANNEL: str = "TP9"            # mastoid used as EOG proxy
+EOG_CHANNEL: str = "TP9"            # relocated below left eye, used as EOG proxy
 ACQUISITION_REFERENCE: str = "FCz"  # nominal (actual varies per subject)
 
-# EEG channels for spectral output (all expected minus EOG)
-EEG_CHANNELS: List[str] = [ch for ch in EXPECTED_CHANNELS if ch != EOG_CHANNEL]
-
-# --- Region mapping for spatial aggregation --------------------------------
-REGION_MAP: Dict[str, List[str]] = {
-    "frontal":   ["Fp1", "Fp2", "Fz", "F3", "F4", "F7", "F8",
-                  "FC1", "FC2", "FC5", "FC6", "FT9", "FT10"],
-    "central":   ["C3", "C4", "Cz"],
-    "parietal":  ["CP1", "CP2", "CP5", "CP6", "Pz", "P3", "P4", "P7", "P8"],
-    "occipital": ["O1", "O2", "Oz"],
-    "temporal":  ["T7", "T8"],
-}
-
 # --- Filtering parameters --------------------------------------------------
-NOTCH_FREQ: float      = 50.0       # Hz  (line noise)
-NOTCH_HARMONICS: bool  = True       # also notch at 100 Hz
-BANDPASS_LOW: float    = 1.0        # Hz  (high-pass)
-BANDPASS_HIGH: float   = 40.0       # Hz  (low-pass)
+NOTCH_FREQ: float         = 50.0    # Hz  (line noise)
+NOTCH_HARMONICS: bool     = True    # also notch at 100 Hz
+ICA_FIT_HIGH_PASS: float  = 1.0     # Hz  (temporary dataset used only to fit ICA)
+FINAL_HIGH_PASS: float    = 0.1     # Hz  (final cleaned dataset keeps low frequencies)
+FILTER_LOW_PASS: float    = 40.0    # Hz  (shared low-pass for ICA-fit and final dataset)
 
 # --- ICA parameters --------------------------------------------------------
 ICA_METHOD: str                      = "fastica"
@@ -129,71 +100,53 @@ ICA_MAX_ITER: int                    = 1000
 
 # --- Bad-channel detection --------------------------------------------------
 USE_PYPREP: bool           = False
-BAD_CHAN_ZSCORE_THRESH: float = 3.0   # robust z-score on variance
+BAD_CHAN_ZSCORE_THRESH: float = 4.0   # robust z-score on windowed variance; higher = less aggressive
 FLATLINE_THRESH_UV: float  = 0.5     # uV - channels with std < this
+BAD_CHAN_WINDOW_SEC: float = 2.0     # variance is evaluated in short windows
+BAD_CHAN_PERSIST_RATIO: float = 0.30  # channel must be outlier in >=30% of windows
+BAD_CHAN_MAX_INTERP_RATIO: float = 0.10  # >10% bad channels → warn, likely reject segment
 
 # --- Artifact annotation ---------------------------------------------------
 # Peak-to-peak threshold per 1-s window (uV). Increase if too many segments
-# are flagged as artifacts (200 is conservative; 300-400 is more lenient).
+# are flagged as artifacts (200-250 is moderate; 300-400 is more lenient).
 # Set to 0 or very high (e.g., 9999) to disable automatic artifact detection.
-ARTIFACT_PTP_THRESH_UV: float = 150.0   # Eye blinks ~100-200 uV; catches real artifacts
+ARTIFACT_PTP_THRESH_UV: float = 250.0   # less aggressive; avoids flagging too many blinks
 AUTO_ARTIFACT_DETECTION: bool = True    # Set to False to skip automatic detection
 # Muscle artifact detection: gamma-band (30-40 Hz) power threshold per 1-s window.
 # Windows where ANY channel exceeds this are flagged BAD_muscle.
 # Units: uV^2/Hz. ~5.0 is a reasonable starting threshold; lower = more aggressive.
-MUSCLE_GAMMA_THRESH_UV2: float = 5.0   # uV^2/Hz; flag window if gamma PSD exceeds this
+MUSCLE_GAMMA_THRESH_UV2: float = 7.5   # uV^2/Hz; slightly less aggressive than before
 
-# --- Spectral analysis -----------------------------------------------------
-WELCH_N_FFT: int      = 2048
-WELCH_N_OVERLAP: int   = 1024
-PSD_FMIN: float        = 1.0
-PSD_FMAX: float        = 40.0
+# --- Inspection / artifact helper parameters -------------------------------
+MUSCLE_GAMMA_BAND: Tuple[float, float] = (30.0, 40.0)
+INSPECT_PSD_N_FFT: int = 2048
+INSPECT_PSD_N_OVERLAP: int = 1024
+INSPECT_PSD_FMIN: float = 1.0
+INSPECT_PSD_FMAX: float = 40.0
 
-FREQ_BANDS: Dict[str, Tuple[float, float]] = {
-    "delta": (1.0,  4.0),
-    "theta": (4.0,  8.0),
-    "alpha": (8.0, 13.0),
-    "beta":  (13.0, 30.0),
-    "gamma": (30.0, 40.0),
-}
-
-# --- Windowing / epoching ---------------------------------------------------
-WINDOW_SEC: float       = 30.0     # window length in seconds
+# --- Segment time rules ----------------------------------------------------
 LB_MAX_SEC: float       = 300.0    # LB: keep first 5 min max
 RECOV_MAX_SEC: float    = 300.0    # Recov: keep first 5 min max
+# CPT: no duration cap — all available data is preprocessed
 BH_TRIM_END_SEC: float  = 10.0     # BH: drop last 10 s
-
-# --- BAD window rejection ---------------------------------------------------
-# A window is rejected only if the fraction of BAD time exceeds this threshold.
-# 0.0 = reject if ANY overlap (old behaviour, very aggressive)
-# 0.25 = reject if >25% of the window is BAD (strict)
-# 0.35 = allow up to 35% BAD
-# 0.40 = allow up to 40% BAD (for BH/apnea with heavy movement artifact)
-# 1.0 = never reject (not recommended)
-BAD_OVERLAP_THRESHOLD: float = 0.40
-
-# --- Baseline correction ---------------------------------------------------
-# We do NOT apply ERP-style baseline correction.  For spectral analysis of
-# long windows, baseline subtraction would distort power estimates.
-# Optional linear detrend per window can be enabled below.
-APPLY_DETREND: bool = False
+PREPROCESS_SEG_TYPES: Tuple[str, ...] = ("LB", "BH", "Recov")
+CONCAT_BH_FOR_PREPROC: bool = True  # treat BH 1-4 as one preprocessing unit
 
 # --- Segment-label expectations (soft; used only for warnings) -------------
 # BH: 4 segments (8 markers)
 EXPECTED_MARKER_COUNTS: Dict[str, int] = {
-    "LB": 2, "Recov": 2, "BH": 8,
+    "LB": 2, "Recov": 2, "BH": 8, "CPT": 2,
 }
 
 # --- File saving flags ------------------------------------------------------
 # Set to False to reduce disk usage (only final cleaned data will be saved)
-SAVE_INTERMEDIATE_FIF: bool = False   # Save .fif after each preprocessing step
-SAVE_EPOCHS_FIF: bool       = False   # Save per-segment Epochs .fif
+SAVE_INTERMEDIATE_FIF: bool = True    # Save .fif after each step (needed for optional ICA sources viewer)
 OVERWRITE_FIF: bool         = True
 # Controls QC/diagnostic files: ICA solution .fif, ICA topomap PNGs,
 # segment overview PNGs, and preprocessing_summary.csv.
-# The clean data .fif and per-subject Excel are always saved regardless.
+# The clean data .fif is always saved regardless.
 # ica_suggest.json is also always saved (needed for manual ICA override).
-SAVE_QC_FILES: bool         = True    # Set False to keep only clean data + Excel
+SAVE_QC_FILES: bool         = True    # Set False to keep only cleaned data
 
 # --- Label normalisation map ------------------------------------------------
 _LABEL_NORMALIZE: Dict[str, str] = {
@@ -201,6 +154,7 @@ _LABEL_NORMALIZE: Dict[str, str] = {
     "bh":       "BH",
     "recov":    "Recov",
     "recovery": "Recov",
+    "cpt":      "CPT",
 }
 
 
@@ -228,11 +182,12 @@ def setup_logging(log_dir: Path = QC_DIR, console_level: int = logging.WARNING) 
         "%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    console_fmt = logging.Formatter("%(levelname)s | %(message)s")
 
     # Console: only warnings by default (keep output clean)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(console_level)
-    ch.setFormatter(fmt)
+    ch.setFormatter(console_fmt)
     logger.addHandler(ch)
 
     # File: full debug
@@ -249,7 +204,7 @@ def setup_logging(log_dir: Path = QC_DIR, console_level: int = logging.WARNING) 
 # ---------------------------------------------------------------------------
 
 def ensure_output_dirs() -> None:
-    for d in (OUTPUT_DIR, FIF_DIR, QC_DIR, EXCEL_DIR):
+    for d in (OUTPUT_DIR, FIF_DIR, QC_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -395,10 +350,15 @@ def parse_annotations(raw: mne.io.BaseRaw) -> Dict[str, List[float]]:
     label_onsets: Dict[str, List[float]] = defaultdict(list)
     for ann in raw.annotations:
         desc = ann["description"].strip()
-        # Strip BrainVision Type/ prefix
+        # Strip BrainVision Type/ prefix (e.g. "Comment/CPT" -> "CPT")
         if "/" in desc:
             desc = desc.split("/", 1)[-1].strip()
-        canonical = _LABEL_NORMALIZE.get(desc.lower())
+        # Normalize key: collapse whitespace, lower case (handles "CPT ", "  cpt", etc.)
+        key = " ".join(desc.lower().split()) if desc else ""
+        canonical = _LABEL_NORMALIZE.get(key)
+        # Fallback: try without spaces (e.g. "C P T" from some export)
+        if canonical is None and key:
+            canonical = _LABEL_NORMALIZE.get(key.replace(" ", ""))
         if canonical is not None:
             label_onsets[canonical].append(float(ann["onset"]))
 
@@ -418,7 +378,7 @@ def reconstruct_segments(
     stored as ``(onset, None)`` so that inspection can flag it.
     """
     segments: Dict[str, List[Tuple[float, Optional[float]]]] = {}
-    for label in ("LB", "BH", "Recov"):
+    for label in ("LB", "BH", "Recov", "CPT"):
         onsets = label_onsets.get(label, [])
         pairs: List[Tuple[float, Optional[float]]] = []
         i = 0
@@ -452,6 +412,7 @@ def inspect_segments(
     display_order = [
         ("LB",    "LB",    1),
         ("BH",    "BH",    4),
+        ("CPT",   "CPT",   1),
         ("Recov", "Recov", 1),
     ]
 
@@ -463,12 +424,19 @@ def inspect_segments(
             continue
 
         n_markers = sum(2 if e is not None else 1 for _, e in intervals)
-        exp_mk = EXPECTED_MARKER_COUNTS.get(label)
+        if label == "BH" and segments.get("_BH_labels"):
+            exp_mk = 2 * len(intervals)
+        else:
+            exp_mk = EXPECTED_MARKER_COUNTS.get(label)
         if exp_mk and n_markers != exp_mk:
             warns.append(f"{label}: expected {exp_mk} markers, found {n_markers}")
 
+        custom_labels = segments.get("_BH_labels") if label == "BH" else None
         for idx, (start, end) in enumerate(intervals):
-            seg_label = f"{prefix} {idx+1}" if expected_n > 1 else prefix
+            if custom_labels and idx < len(custom_labels):
+                seg_label = custom_labels[idx]
+            else:
+                seg_label = f"{prefix} {idx+1}" if expected_n > 1 else prefix
             if end is None:
                 lines.append(
                     f"  {seg_label:<14s}:  UNPAIRED MARKER  |  "
@@ -514,6 +482,7 @@ def save_segments_json(
     payload = {
         lab: [{"start": s, "end": e} for s, e in ivs]
         for lab, ivs in segments.items()
+        if not lab.startswith("_")
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -637,7 +606,9 @@ def step1_setup_channels(
                 logger.info(
                     f"S{subj_id} | Adding reference '{ch_name}' back as flat channel"
                 )
-                raw = mne.add_reference_channels(raw, ch_name)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    raw = mne.add_reference_channels(raw, ch_name)
             else:
                 logger.warning(f"S{subj_id} | Channel '{ch_name}' not in data")
 
@@ -672,61 +643,21 @@ def step2_set_montage(
 # ---- Step 3: Filtering ---------------------------------------------------
 
 def step3_filter(
-    raw: mne.io.Raw, subj_id: Union[int, str],
+    raw: mne.io.Raw,
+    subj_id: Union[int, str],
+    high_pass: float,
+    low_pass: float,
+    dataset_label: str,
 ) -> mne.io.Raw:
-    logger.info(f"S{subj_id} | Step 3  Filtering")
+    logger.info(f"S{subj_id} | Step 3  Filtering ({dataset_label})")
     freqs = [NOTCH_FREQ]
     if NOTCH_HARMONICS:
         freqs.append(NOTCH_FREQ * 2)
     raw.notch_filter(freqs, verbose=False)
-    raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
+    raw.filter(high_pass, low_pass, verbose=False)
     logger.info(
-        f"S{subj_id} | Notch {freqs} Hz, BP {BANDPASS_LOW}-{BANDPASS_HIGH} Hz"
+        f"S{subj_id} | {dataset_label}: Notch {freqs} Hz, BP {high_pass}-{low_pass} Hz"
     )
-    return raw
-
-
-# ---- Step 4: Average re-reference ----------------------------------------
-
-def step4_rereference(
-    raw: mne.io.Raw, subj_id: Union[int, str],
-) -> mne.io.Raw:
-    """
-    Re-reference all EEG channels to the common average.
-
-    TP9 (typed eog) is automatically excluded from the average computation
-    by MNE, but remains in the data for ICA EOG detection.
-
-    FCz handling: if the acquisition reference (FCz) was re-added as a flat
-    zero-signal channel in step1, including it in the average reference dilutes
-    the mean. We temporarily mark it as bad so MNE excludes it from the average
-    computation, then interpolate it afterward to recover a meaningful estimate.
-    """
-    logger.info(f"S{subj_id} | Step 4  Average reference")
-
-    ref_ch = ACQUISITION_REFERENCE  # typically "FCz"
-    added_to_bads = False
-    if ref_ch in raw.ch_names and ref_ch not in raw.info["bads"]:
-        # Check if it is a flat (re-added) channel: std < flatline threshold
-        eeg_idx_ref = mne.pick_channels(raw.ch_names, [ref_ch])
-        if eeg_idx_ref:
-            ref_std_uv = float(raw.get_data(picks=eeg_idx_ref).std()) * 1e6
-            if ref_std_uv < FLATLINE_THRESH_UV:
-                raw.info["bads"].append(ref_ch)
-                added_to_bads = True
-                logger.info(
-                    f"S{subj_id} | '{ref_ch}' std={ref_std_uv:.4f} uV "
-                    f"-> marked bad before avg ref to exclude from average"
-                )
-
-    raw, _ = mne.set_eeg_reference(raw, ref_channels="average", verbose=False)
-
-    # Interpolate the excluded reference channel so it carries a real estimate
-    if added_to_bads and ref_ch in raw.info["bads"]:
-        logger.info(f"S{subj_id} | Interpolating '{ref_ch}' after average reference")
-        raw.interpolate_bads(reset_bads=True, verbose=False)
-
-    logger.info(f"S{subj_id} | Step 4 done")
     return raw
 
 
@@ -740,58 +671,84 @@ def _robust_zscore(x: np.ndarray) -> np.ndarray:
 
 
 def step5_bad_channels(
-    raw: mne.io.Raw, subj_id: Union[int, str],
+    raw: mne.io.Raw,
+    subj_id: Union[int, str],
+    context: Optional[str] = None,
 ) -> Tuple[mne.io.Raw, List[str]]:
-    """Detect + interpolate bad EEG channels (variance / flatline heuristic)."""
-    logger.info(f"S{subj_id} | Step 5  Bad-channel detection")
+    """Detect bad EEG channels (windowed variance / flatline heuristic).
+
+    Only marks channels in raw.info["bads"] — does NOT interpolate.
+    Interpolation happens after ICA in step_interpolate_bad_channels().
+
+    FCz (ACQUISITION_REFERENCE) is excluded from detection: it is flat by
+    design (re-added as zero-signal channel) and handled in step_rereference.
+    """
+    scope = f" [{context}]" if context else ""
+    logger.info(f"S{subj_id} | Step 4  Bad-channel detection{scope}")
 
     eeg_idx = mne.pick_types(raw.info, eeg=True, eog=False)
     eeg_names = [raw.ch_names[i] for i in eeg_idx]
-    data = raw.get_data(picks=eeg_idx)
+
+    # Exclude ACQUISITION_REFERENCE from detection — it is flat by design
+    ref_ch = ACQUISITION_REFERENCE
+    eeg_names_detect = [n for n in eeg_names if n != ref_ch]
+    detect_idx = [eeg_idx[eeg_names.index(n)] for n in eeg_names_detect]
+
+    data = raw.get_data(picks=detect_idx)
     bads: List[str] = []
 
     if USE_PYPREP and HAS_PYPREP:
         try:
             nd = NoisyChannels(raw, do_detrend=True, random_state=ICA_RANDOM_STATE)
             nd.find_all_bads()
-            bads = list(nd.get_bads())
+            pyprep_bads = [b for b in nd.get_bads() if b != ref_ch]
+            bads = list(pyprep_bads)
             logger.info(f"S{subj_id} | pyprep bads: {bads}")
         except Exception as exc:
             logger.warning(f"S{subj_id} | pyprep failed ({exc}), using heuristic")
 
     if not bads:
         ch_std = np.std(data, axis=1)
-        ch_var = np.var(data, axis=1)
-        for i, name in enumerate(eeg_names):
+        for i, name in enumerate(eeg_names_detect):
             if ch_std[i] * 1e6 < FLATLINE_THRESH_UV:
                 bads.append(name)
                 logger.info(f"S{subj_id} | Flatline: {name}  std={ch_std[i]*1e6:.4f} uV")
-        zsc = _robust_zscore(ch_var)
-        for i, name in enumerate(eeg_names):
-            if abs(zsc[i]) > BAD_CHAN_ZSCORE_THRESH and name not in bads:
-                bads.append(name)
-                logger.info(f"S{subj_id} | Variance outlier: {name}  z={zsc[i]:.2f}")
+
+        win_samp = max(1, int(BAD_CHAN_WINDOW_SEC * raw.info["sfreq"]))
+        n_windows = data.shape[1] // win_samp
+        if n_windows > 0:
+            bad_counts = np.zeros(len(eeg_names_detect), dtype=int)
+            for win_idx in range(n_windows):
+                start = win_idx * win_samp
+                stop = start + win_samp
+                win_var = np.var(data[:, start:stop], axis=1)
+                zsc = _robust_zscore(win_var)
+                bad_counts += (zsc > BAD_CHAN_ZSCORE_THRESH).astype(int)
+
+            bad_ratio = bad_counts / n_windows
+            for i, name in enumerate(eeg_names_detect):
+                if name in bads:
+                    continue
+                if bad_ratio[i] >= BAD_CHAN_PERSIST_RATIO:
+                    bads.append(name)
+                    logger.info(
+                        f"S{subj_id} | Persistent variance outlier: {name}  "
+                        f"{bad_counts[i]}/{n_windows} windows ({bad_ratio[i]*100:.0f}%)"
+                    )
 
     raw.info["bads"] = bads
-    logger.info(f"S{subj_id} | Bad channels: {bads if bads else 'none'}")
-
-    (subject_qc_dir(subj_id) / "bad_channels.json").write_text(
-        json.dumps({"bad_channels": bads}, indent=2), encoding="utf-8",
-    )
-
-    if bads:
-        logger.info(f"S{subj_id} | Interpolating {len(bads)} channel(s)")
-        raw.interpolate_bads(reset_bads=True, verbose=False)
-
-    logger.info(f"S{subj_id} | Step 5 done")
+    logger.info(f"S{subj_id} | Bad channels marked{scope}: {bads if bads else 'none'}")
+    logger.info(f"S{subj_id} | Step 4 done")
     return raw, bads
 
 
 # ---- Step 6: Artifact annotation -----------------------------------------
 
 def step6_annotate_artifacts(
-    raw: mne.io.Raw, subj_id: Union[int, str],
-) -> mne.io.Raw:
+    raw: mne.io.Raw,
+    subj_id: Union[int, str],
+    context: Optional[str] = None,
+) -> Tuple[mne.io.Raw, mne.Annotations]:
     """Mark 1-s windows as BAD based on two automatic checks:
 
     1. **BAD_artifact**: peak-to-peak amplitude exceeds ARTIFACT_PTP_THRESH_UV (gross
@@ -802,11 +759,12 @@ def step6_annotate_artifacts(
     Windows already flagged as BAD_artifact are not double-flagged as BAD_muscle.
     If AUTO_ARTIFACT_DETECTION is False, this step is skipped entirely.
     """
-    logger.info(f"S{subj_id} | Step 6  Artifact annotation")
+    scope = f" [{context}]" if context else ""
+    logger.info(f"S{subj_id} | Step 5  Artifact annotation{scope}")
 
     if not AUTO_ARTIFACT_DETECTION:
-        logger.info(f"S{subj_id} | Auto artifact detection disabled, skipping")
-        return raw
+        logger.info(f"S{subj_id} | Auto artifact detection disabled, skipping{scope}")
+        return raw, mne.Annotations([], [], [], orig_time=raw.annotations.orig_time)
 
     eeg_idx = mne.pick_types(raw.info, eeg=True, eog=False)
     sfreq = raw.info["sfreq"]
@@ -816,7 +774,7 @@ def step6_annotate_artifacts(
     thresh_v = ARTIFACT_PTP_THRESH_UV * 1e-6
 
     # Gamma band limits for muscle detection
-    gamma_low, gamma_high = FREQ_BANDS.get("gamma", (30.0, 40.0))
+    gamma_low, gamma_high = MUSCLE_GAMMA_BAND
     muscle_thresh_v2hz = MUSCLE_GAMMA_THRESH_UV2 * 1e-12  # uV^2/Hz -> V^2/Hz
 
     ptp_onsets, ptp_durs = [], []
@@ -835,8 +793,8 @@ def step6_annotate_artifacts(
 
         # --- Gamma-band muscle check ---
         try:
-            eff_nfft = min(WELCH_N_FFT, win_samp)
-            eff_noverlap = min(WELCH_N_OVERLAP, eff_nfft - 1)
+            eff_nfft = min(INSPECT_PSD_N_FFT, win_samp)
+            eff_noverlap = min(INSPECT_PSD_N_OVERLAP, eff_nfft - 1)
             psd_win, freqs_win = mne.time_frequency.psd_array_welch(
                 seg, sfreq=sfreq,
                 fmin=gamma_low, fmax=gamma_high,
@@ -851,49 +809,57 @@ def step6_annotate_artifacts(
         except Exception:
             pass  # too short or degenerate window — skip silently
 
+    auto_annotations = mne.Annotations([], [], [], orig_time=raw.annotations.orig_time)
     new_annotations = raw.annotations
     if ptp_onsets:
-        new_annotations = new_annotations + mne.Annotations(
+        ptp_annotations = mne.Annotations(
             onset=ptp_onsets, duration=ptp_durs,
             description=["BAD_artifact"] * len(ptp_onsets),
             orig_time=raw.annotations.orig_time,
         )
-        logger.info(f"S{subj_id} | {len(ptp_onsets)} s flagged as BAD_artifact")
+        auto_annotations = auto_annotations + ptp_annotations
+        new_annotations = new_annotations + ptp_annotations
+        logger.info(f"S{subj_id} | {len(ptp_onsets)} s flagged as BAD_artifact{scope}")
     else:
-        logger.info(f"S{subj_id} | No gross artefacts detected (PTP)")
+        logger.info(f"S{subj_id} | No gross artefacts detected (PTP){scope}")
 
     if muscle_onsets:
-        new_annotations = new_annotations + mne.Annotations(
+        muscle_annotations = mne.Annotations(
             onset=muscle_onsets, duration=muscle_durs,
             description=["BAD_muscle"] * len(muscle_onsets),
             orig_time=raw.annotations.orig_time,
         )
-        logger.info(f"S{subj_id} | {len(muscle_onsets)} s flagged as BAD_muscle")
+        auto_annotations = auto_annotations + muscle_annotations
+        new_annotations = new_annotations + muscle_annotations
+        logger.info(f"S{subj_id} | {len(muscle_onsets)} s flagged as BAD_muscle{scope}")
     else:
-        logger.info(f"S{subj_id} | No muscle artefacts detected (gamma)")
+        logger.info(f"S{subj_id} | No muscle artefacts detected (gamma){scope}")
 
-    raw.set_annotations(new_annotations)
-    logger.info(f"S{subj_id} | Step 6 done")
-    return raw
+    safe_set_annotations(raw, new_annotations)
+    logger.info(f"S{subj_id} | Step 5 done")
+    return raw, auto_annotations
 
 
-# ---- Step 7: ICA ---------------------------------------------------------
+# ---- Step 6: ICA ---------------------------------------------------------
 
 def step7_ica(
-    raw: mne.io.Raw, subj_id: Union[int, str],
+    raw_ica: mne.io.Raw,
+    raw_apply: mne.io.Raw,
+    subj_id: Union[int, str],
+    fit_segments: Optional[List[str]] = None,
 ) -> mne.io.Raw:
     """
-    Fit ICA, auto-detect EOG components via TP9, and apply.
+    Fit ICA on a temporary high-pass-filtered dataset and apply it to the final dataset.
 
     Decision logic:
     * Save auto-suggestion to ``ica_suggest.json``.
     * If ``ica_exclude.json`` exists (manual override), use it.
     * Otherwise use the suggestion and write a template for future manual edits.
     """
-    logger.info(f"S{subj_id} | Step 7  ICA")
+    logger.info(f"S{subj_id} | Step 6  ICA")
     qdir = subject_qc_dir(subj_id)
 
-    rank_dict = mne.compute_rank(raw, rank="info", verbose=False)
+    rank_dict = mne.compute_rank(raw_ica, rank="info", verbose=False)
     eeg_rank = rank_dict.get("eeg", None)
     n_comp = ICA_N_COMPONENTS
     # If n_comp is None, fall back to variance-based (0.999999) to avoid unstable mixing matrix
@@ -905,7 +871,7 @@ def step7_ica(
         n_components=n_comp, method=ICA_METHOD,
         random_state=ICA_RANDOM_STATE, max_iter=ICA_MAX_ITER,
     )
-    ica.fit(raw, picks="eeg", reject_by_annotation=True, verbose=False)
+    ica.fit(raw_ica, picks="eeg", reject_by_annotation=True, verbose=False)
     logger.info(f"S{subj_id} | ICA fitted ({ica.n_components_} components)")
 
     if SAVE_QC_FILES:
@@ -914,10 +880,10 @@ def step7_ica(
     # EOG component detection
     eog_idx: List[int] = []
     eog_scores = np.array([])
-    if EOG_CHANNEL in raw.ch_names:
+    if EOG_CHANNEL in raw_ica.ch_names:
         try:
             eog_idx, eog_scores = ica.find_bads_eog(
-                raw, ch_name=EOG_CHANNEL, verbose=False,
+                raw_ica, ch_name=EOG_CHANNEL, verbose=False,
             )
             logger.info(f"S{subj_id} | Auto EOG components: {eog_idx}")
         except Exception as exc:
@@ -925,30 +891,12 @@ def step7_ica(
     else:
         logger.warning(f"S{subj_id} | EOG channel '{EOG_CHANNEL}' absent")
 
-    # ECG / heartbeat component detection (proxy: Fp2 frontal channel)
-    # The BCG artifact appears as a regular ~1 Hz pattern in many channels.
-    # No dedicated ECG electrode is present, so we use Fp2 as a proxy.
-    ecg_idx: List[int] = []
-    ecg_scores = np.array([])
-    ecg_proxy = "Fp2"
-    if ecg_proxy in raw.ch_names:
-        try:
-            ecg_idx, ecg_scores = ica.find_bads_ecg(
-                raw, ch_name=ecg_proxy, method="correlation", verbose=False,
-            )
-            logger.info(f"S{subj_id} | Auto ECG components (via {ecg_proxy}): {ecg_idx}")
-        except Exception as exc:
-            logger.warning(f"S{subj_id} | ECG detection error: {exc}")
-    else:
-        logger.warning(f"S{subj_id} | ECG proxy channel '{ecg_proxy}' absent")
-
     suggestion = {
         "auto_eog_indices": [int(x) for x in eog_idx],
         "eog_scores": eog_scores.tolist() if eog_scores.size else [],
-        "auto_ecg_indices": [int(x) for x in ecg_idx],
-        "ecg_scores": ecg_scores.tolist() if ecg_scores.size else [],
         "n_components": int(ica.n_components_),
         "method": ICA_METHOD,
+        "fit_segments": fit_segments or [],
     }
     (qdir / "ica_suggest.json").write_text(
         json.dumps(suggestion, indent=2), encoding="utf-8",
@@ -969,8 +917,8 @@ def step7_ica(
         except Exception as exc:
             logger.warning(f"S{subj_id} | ICA plot failed: {exc}")
 
-    # Decide which components to exclude (EOG + ECG auto-suggestions combined)
-    auto_exclude = sorted(set([int(x) for x in eog_idx] + [int(x) for x in ecg_idx]))
+    # Decide which components to exclude (ocular auto-suggestions only).
+    auto_exclude = sorted(set([int(x) for x in eog_idx]))
     override_path = qdir / "ica_exclude.json"
     if override_path.exists():
         try:
@@ -986,33 +934,132 @@ def step7_ica(
                 "exclude": exclude,
                 "_comment": (
                     "Edit 'exclude' list to override ICA component removal. "
-                    "auto_eog and auto_ecg indices are suggestions only — "
+                    "auto_eog indices are suggestions only — "
                     "verify with ica_topomap_*.png before re-running Cell 4."
                 ),
                 "auto_eog_indices": [int(x) for x in eog_idx],
-                "auto_ecg_indices": [int(x) for x in ecg_idx],
             }, indent=2),
             encoding="utf-8",
         )
 
     ica.exclude = exclude
-    raw = ica.apply(raw, verbose=False)
-    logger.info(f"S{subj_id} | Step 7 done - removed {len(exclude)} component(s)")
+    raw_apply = ica.apply(raw_apply, verbose=False)
+    logger.info(
+        f"S{subj_id} | Step 6 done - removed {len(exclude)} component(s)"
+    )
+    return raw_apply
+
+
+# ---- Step 7: Interpolate bad channels (after ICA) -------------------------
+
+def step_interpolate_bad_channels(
+    raw: mne.io.Raw,
+    subj_id: Union[int, str],
+    bads: List[str],
+    context: Optional[str] = None,
+) -> mne.io.Raw:
+    """Interpolate bad channels detected in step5_bad_channels.
+
+    Called AFTER ICA so that bad channels do not corrupt the decomposition.
+    If more than BAD_CHAN_MAX_INTERP_RATIO (10%) of EEG channels are bad,
+    a warning is printed — the segment may need to be rejected downstream.
+    """
+    scope = f" [{context}]" if context else ""
+    logger.info(f"S{subj_id} | Step 7  Interpolating bad channels{scope}")
+
+    # Re-set bads in case ICA modified raw.info["bads"]
+    raw.info["bads"] = bads
+
+    if not bads:
+        logger.info(f"S{subj_id} | No bad channels to interpolate{scope}")
+        logger.info(f"S{subj_id} | Step 7 done")
+        return raw
+
+    n_eeg = len(mne.pick_types(raw.info, eeg=True, eog=False))
+    ratio = len(bads) / n_eeg if n_eeg > 0 else 0.0
+    if ratio > BAD_CHAN_MAX_INTERP_RATIO:
+        msg = (
+            f"S{subj_id} | {context or 'Segment'}: {len(bads)}/{n_eeg} EEG channels bad "
+            f"({ratio*100:.0f}% > {BAD_CHAN_MAX_INTERP_RATIO*100:.0f}%). "
+            f"Consider excluding it from analysis."
+        )
+        logger.warning(msg)
+
+    logger.info(f"S{subj_id} | Interpolating {len(bads)} channel(s){scope}: {bads}")
+    raw.interpolate_bads(reset_bads=True, verbose=False)
+    logger.info(f"S{subj_id} | Step 7 done")
+    return raw
+
+
+# ---- Step 8: Average re-reference (after ICA + interpolation) -------------
+
+def step_rereference(
+    raw: mne.io.Raw,
+    subj_id: Union[int, str],
+    context: Optional[str] = None,
+) -> mne.io.Raw:
+    """Re-reference all EEG channels to the common average.
+
+    Applied AFTER ICA and bad-channel interpolation to avoid rank deficiency
+    issues during ICA fitting (Kim et al. 2023; Bigdely-Shamlo et al. 2015).
+
+    TP9 (typed eog) is automatically excluded from the average computation
+    by MNE, but remains in the data for any downstream use.
+
+    FCz handling: the acquisition reference is treated as a non-physiological
+    channel in this montage. It is always excluded from the average-reference
+    computation and interpolated afterward so the final dataset preserves the
+    original channel layout without contaminating the average.
+    """
+    scope = f" [{context}]" if context else ""
+    logger.info(f"S{subj_id} | Step 8  Average reference{scope}")
+
+    ref_ch = ACQUISITION_REFERENCE  # typically "FCz"
+    excluded_ref = False
+    if ref_ch in raw.ch_names:
+        if ref_ch not in raw.info["bads"]:
+            raw.info["bads"].append(ref_ch)
+        excluded_ref = True
+        logger.info(
+            f"S{subj_id} | Excluding acquisition reference '{ref_ch}' from "
+            "average reference"
+        )
+
+    raw, _ = mne.set_eeg_reference(raw, ref_channels="average", verbose=False)
+
+    if excluded_ref and ref_ch in raw.info["bads"]:
+        logger.info(f"S{subj_id} | Interpolating '{ref_ch}' after average reference{scope}")
+        raw.interpolate_bads(reset_bads=True, verbose=False)
+
+    logger.info(f"S{subj_id} | Step 8 done")
     return raw
 
 
 # ---------------------------------------------------------------------------
-# 1.11  PREPROCESSING DRIVER  (Steps 1-7 only, takes already-loaded raw)
+# 1.11  PREPROCESSING DRIVER  (Steps 1-8, takes already-loaded raw)
 # ---------------------------------------------------------------------------
 
 def run_preprocessing_steps(
     raw: mne.io.Raw,
     subj_id: Union[int, str],
-) -> Tuple[mne.io.Raw, List[str], Dict[str, Any]]:
+    segments: Dict[str, List[Tuple[float, Optional[float]]]],
+) -> Tuple[mne.io.Raw, List[str], Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """
-    Run Steps 1-7 on an already-loaded raw object.
+    Run Steps 1-8 on an already-loaded raw object.
 
-    Returns (raw_clean, bad_channels, ica_info).
+    Pipeline order (Kim 2023; Klug 2024; Makoto):
+      1. Channel setup
+      2. Montage
+      3. Create two filtered copies after montage:
+         - ICA-fit dataset: 1-40 Hz + notch
+         - Final dataset: 0.1-40 Hz + notch
+      4. Detect bad channels by preprocessing unit (LB / BH / Recov)
+      5. Annotate gross artifacts by segment on the ICA-fit dataset
+      6. Fit ICA on concatenated analysis segments and apply it to the final dataset
+      7. Interpolate bad channels per preprocessing unit
+      8. Average re-reference per preprocessing unit
+
+    Returns (raw_clean, bad_channels_union, ica_info, segment_qc).
     Raises on failure (caller should handle).
     """
     # Step 1 - channels
@@ -1021,41 +1068,131 @@ def run_preprocessing_steps(
     save_step(raw, subj_id, "step1_channels")
 
     # Step 2 - montage
-    print(f"  [Step 2] Applying montage (standard_1020)...")
+    print(f"\n  [Step 2] Applying montage (standard_1020)...")
     raw = step2_set_montage(raw, subj_id)
     save_step(raw, subj_id, "step2_montage")
 
     # Step 3 - filtering
-    print(f"  [Step 3] Filtering (notch + bandpass)...")
-    raw = step3_filter(raw, subj_id)
-    save_step(raw, subj_id, "step3_filtered")
+    print(
+        f"\n  [Step 3a] Creating ICA-fit filtered copy "
+        f"({ICA_FIT_HIGH_PASS:.1f}-{FILTER_LOW_PASS:.1f} Hz + notch)..."
+    )
+    raw_ica = step3_filter(
+        raw.copy(), subj_id,
+        high_pass=ICA_FIT_HIGH_PASS,
+        low_pass=FILTER_LOW_PASS,
+        dataset_label="ICA fit",
+    )
+    save_step(raw_ica, subj_id, "step3_ica_filtered")
 
-    # Step 4 - average reference
-    print(f"  [Step 4] Applying average reference...")
-    raw = step4_rereference(raw, subj_id)
-    save_step(raw, subj_id, "step4_refavg")
+    print(
+        f"\n  [Step 3b] Creating final filtered copy "
+        f"({FINAL_HIGH_PASS:.1f}-{FILTER_LOW_PASS:.1f} Hz + notch)..."
+    )
+    raw_final = step3_filter(
+        raw.copy(), subj_id,
+        high_pass=FINAL_HIGH_PASS,
+        low_pass=FILTER_LOW_PASS,
+        dataset_label="final output",
+    )
+    save_step(raw_final, subj_id, "step3_final_filtered")
+    save_step(raw_final, subj_id, "step3_filtered")
 
-    # Step 5 - bad channels
-    print(f"  [Step 5] Detecting & interpolating bad channels...")
-    raw, bads = step5_bad_channels(raw, subj_id)
-    if bads:
-        print(f"           Bad channels: {bads}")
-    else:
-        print(f"           No bad channels detected")
-    save_step(raw, subj_id, "step5_interpolated")
+    units = build_preprocessing_units(segments)
+    if not units:
+        raise RuntimeError("No valid LB/BH/Recov segments available for preprocessing.")
 
-    # Step 6 - artefact annotation
-    print(f"  [Step 6] Annotating gross artifacts...")
-    n_bad_before = sum(1 for a in raw.annotations if "BAD" in a["description"])
-    raw = step6_annotate_artifacts(raw, subj_id)
-    n_bad_after = sum(1 for a in raw.annotations if "BAD" in a["description"])
-    print(f"           {n_bad_after - n_bad_before} s flagged as BAD_artifact")
-    save_step(raw, subj_id, "step6_annotated")
+    # Step 4 - bad-channel detection by segment/unit
+    print(f"\n  [Step 4] Detecting bad channels by segment...")
+    segment_qc: Dict[str, Dict[str, Any]] = {}
+    all_bads_set = set()
+    unit_ica_raws: List[mne.io.Raw] = []
+    auto_annotations_abs = mne.Annotations([], [], [], orig_time=raw_ica.annotations.orig_time)
 
-    # Step 7 - ICA
-    print(f"  [Step 7] Running ICA (this may take a few minutes)...")
-    raw = step7_ica(raw, subj_id)
-    save_step(raw, subj_id, "step7_ica")
+    for unit in units:
+        unit_raw_for_bads, _ = crop_and_concat_segments(raw_ica, unit["segments"])
+        _, unit_bads = step5_bad_channels(unit_raw_for_bads, subj_id, context=unit["display_name"])
+
+        annotated_parts: List[mne.io.Raw] = []
+        artifact_seconds = 0.0
+        for seg in unit["segments"]:
+            seg_raw = raw_ica.copy().crop(tmin=seg["start"], tmax=seg["end"])
+            seg_raw, auto_ann = step6_annotate_artifacts(seg_raw, subj_id, context=seg["name"])
+            annotated_parts.append(seg_raw)
+            artifact_seconds += float(np.sum(auto_ann.duration)) if len(auto_ann) else 0.0
+            auto_annotations_abs = auto_annotations_abs + shift_annotations(
+                auto_ann, seg["start"], raw_ica.annotations.orig_time
+            )
+
+        unit_raw_ica = annotated_parts[0] if len(annotated_parts) == 1 else mne.concatenate_raws(
+            annotated_parts, preload=True, verbose=False
+        )
+        unit_ica_raws.append(unit_raw_ica)
+        segment_qc[unit["label"]] = {
+            "display_name": unit["display_name"],
+            "segments": unit["segments"],
+            "segment_names": [seg["name"] for seg in unit["segments"]],
+            "bads": sorted(unit_bads),
+            "artifact_seconds": artifact_seconds,
+        }
+        all_bads_set.update(unit_bads)
+
+        if unit_bads:
+            print(f"           {unit['display_name']}: {sorted(unit_bads)}")
+        else:
+            print(f"           {unit['display_name']}: no bad channels detected")
+
+    bads = sorted(all_bads_set)
+    raw_ica.info["bads"] = list(bads)
+    raw_final.info["bads"] = list(bads)
+    save_bad_channel_report(subj_id, bads, segment_qc)
+    save_step(raw_ica, subj_id, "step4_bads_detected")
+
+    # Step 5 - artifact annotation by segment
+    print(f"\n  [Step 5] Annotating gross artifacts by segment...")
+    safe_set_annotations(raw_ica, raw_ica.annotations + auto_annotations_abs)
+    safe_set_annotations(raw_final, raw_final.annotations + auto_annotations_abs)
+    for unit in units:
+        qc = segment_qc[unit["label"]]
+        print(
+            f"           {qc['display_name']}: "
+            f"{qc['artifact_seconds']:.1f} s flagged as BAD_artifact/BAD_muscle"
+        )
+    save_step(raw_ica, subj_id, "step5_annotated")
+
+    # Step 6 - ICA on concatenated analysis segments
+    print(f"\n  [Step 6] Running ICA...")
+    raw_ica_fit = unit_ica_raws[0] if len(unit_ica_raws) == 1 else mne.concatenate_raws(
+        unit_ica_raws, preload=True, verbose=False
+    )
+    fit_segment_names = [unit["display_name"] for unit in units]
+    raw_final = step7_ica(raw_ica_fit, raw_final, subj_id, fit_segments=fit_segment_names)
+    print(f"           Fit on concatenated segments: {', '.join(fit_segment_names)}")
+    save_step(raw_final, subj_id, "step6_ica")
+
+    # Step 7 + Step 8 - clean each processing unit independently
+    print(f"\n  [Step 7] Interpolating bad channels by segment...")
+    for unit in units:
+        qc = segment_qc[unit["label"]]
+        unit_raw_final, unit_lengths = crop_and_concat_segments(raw_final, unit["segments"])
+        unit_raw_final = step_interpolate_bad_channels(
+            unit_raw_final, subj_id, qc["bads"], context=qc["display_name"]
+        )
+        write_unit_data_back(raw_final, unit_raw_final, unit["segments"], unit_lengths)
+        if qc["bads"]:
+            print(f"           {qc['display_name']}: interpolated {qc['bads']}")
+        else:
+            print(f"           {qc['display_name']}: no interpolation needed")
+    save_step(raw_final, subj_id, "step7_interpolated")
+
+    print(f"\n  [Step 8] Applying average reference by segment...")
+    for unit in units:
+        qc = segment_qc[unit["label"]]
+        unit_raw_final, unit_lengths = crop_and_concat_segments(raw_final, unit["segments"])
+        unit_raw_final = step_rereference(unit_raw_final, subj_id, context=qc["display_name"])
+        write_unit_data_back(raw_final, unit_raw_final, unit["segments"], unit_lengths)
+        print(f"           {qc['display_name']}: average reference applied")
+    save_step(raw_final, subj_id, "step8_refavg")
 
     # Gather ICA QC info
     ica_info: Dict[str, Any] = {"method": ICA_METHOD, "excluded": []}
@@ -1070,7 +1207,7 @@ def run_preprocessing_steps(
 
     print(f"\n  Preprocessing complete.")
     print(f"  ICA components excluded: {ica_info.get('excluded', [])}")
-    return raw, bads, ica_info
+    return raw_final, bads, ica_info, segment_qc
 
 
 # ---------------------------------------------------------------------------
@@ -1081,16 +1218,22 @@ def _iter_valid_segments(
     segments: Dict[str, List[Tuple[float, Optional[float]]]],
 ) -> List[Tuple[str, int, float, float]]:
     """Yield (seg_type, seg_idx_1based, start, end) for all valid intervals."""
-    # Only BH has multiple segments (4)
     order = [
-        ("LB", 1), ("BH", 4), ("Recov", 1),
+        ("LB", 1), ("BH", 4), ("Recov", 1), ("CPT", 1),
     ]
     result = []
     for label, expected_n in order:
-        for idx, (start, end) in enumerate(segments.get(label, [])):
+        intervals = segments.get(label, [])
+        custom_labels = segments.get("_BH_labels") if label == "BH" else None
+        if custom_labels and len(custom_labels) != len(intervals):
+            custom_labels = None
+        for idx, (start, end) in enumerate(intervals):
             if end is None or end <= start:
                 continue
-            seg_name = f"{label} {idx+1}" if expected_n > 1 else label
+            if custom_labels and idx < len(custom_labels):
+                seg_name = custom_labels[idx]
+            else:
+                seg_name = f"{label} {idx+1}" if expected_n > 1 else label
             result.append((seg_name, idx + 1, start, end))
     return result
 
@@ -1108,16 +1251,143 @@ def get_segments_by_type(
     """
     # Only BH has multiple segments (4)
     expected_n = {"LB": 1, "BH": 4, "Recov": 1}.get(seg_type, 1)
+    intervals = segments.get(seg_type, [])
+    custom_labels = segments.get("_BH_labels") if seg_type == "BH" else None
+    if custom_labels and len(custom_labels) != len(intervals):
+        custom_labels = None
     result = []
-    for idx, (start, end) in enumerate(segments.get(seg_type, [])):
+    for idx, (start, end) in enumerate(intervals):
         if end is None or end <= start:
             continue
         # Apply time rules if requested
         if apply_time_rules:
             start, end = apply_segment_rules(seg_type, start, end)
-        seg_name = f"{seg_type} {idx+1}" if expected_n > 1 else seg_type
+        if custom_labels and idx < len(custom_labels):
+            seg_name = custom_labels[idx]
+        else:
+            seg_name = f"{seg_type} {idx+1}" if expected_n > 1 else seg_type
         result.append((seg_name, idx + 1, start, end))
     return result
+
+
+def build_preprocessing_units(
+    segments: Dict[str, List[Tuple[float, Optional[float]]]],
+) -> List[Dict[str, Any]]:
+    """Build processing units used from Step 4 onward.
+
+    LB and Recov are processed independently. BH can be treated as one
+    concatenated unit so that bad-channel detection / ICA training sees all
+    breath-hold periods together.
+    """
+    units: List[Dict[str, Any]] = []
+    for seg_type in PREPROCESS_SEG_TYPES:
+        segs = get_segments_by_type(segments, seg_type, apply_time_rules=True)
+        if not segs:
+            continue
+        if seg_type == "BH" and CONCAT_BH_FOR_PREPROC:
+            units.append({
+                "label": "BH",
+                "display_name": "BH",
+                "segments": [
+                    {"name": seg_name, "idx": seg_idx, "start": start, "end": end}
+                    for seg_name, seg_idx, start, end in segs
+                ],
+            })
+            continue
+        for seg_name, seg_idx, start, end in segs:
+            units.append({
+                "label": seg_name,
+                "display_name": seg_name,
+                "segments": [{
+                    "name": seg_name,
+                    "idx": seg_idx,
+                    "start": start,
+                    "end": end,
+                }],
+            })
+    return units
+
+
+def crop_and_concat_segments(
+    raw: mne.io.Raw,
+    segments: List[Dict[str, Any]],
+) -> Tuple[mne.io.Raw, List[int]]:
+    """Crop one or more segments and concatenate them into a single Raw."""
+    parts: List[mne.io.Raw] = []
+    lengths: List[int] = []
+    for seg in segments:
+        part = raw.copy().crop(tmin=seg["start"], tmax=seg["end"])
+        parts.append(part)
+        lengths.append(part.n_times)
+    if not parts:
+        raise ValueError("No valid segments to crop.")
+    if len(parts) == 1:
+        return parts[0], lengths
+    merged = mne.concatenate_raws(parts, preload=True, verbose=False)
+    return merged, lengths
+
+
+def shift_annotations(
+    annotations: mne.Annotations,
+    onset_offset: float,
+    orig_time: Optional[datetime],
+) -> mne.Annotations:
+    """Shift annotations by a fixed number of seconds."""
+    if len(annotations) == 0:
+        return mne.Annotations([], [], [], orig_time=orig_time)
+    return mne.Annotations(
+        onset=[float(onset + onset_offset) for onset in annotations.onset],
+        duration=[float(duration) for duration in annotations.duration],
+        description=[str(desc) for desc in annotations.description],
+        orig_time=orig_time,
+    )
+
+
+def safe_set_annotations(raw: mne.io.Raw, annotations: mne.Annotations) -> None:
+    """Apply annotations while hiding benign crop-range RuntimeWarnings."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        raw.set_annotations(annotations)
+
+
+def save_bad_channel_report(
+    subj_id: Union[int, str],
+    all_bads: List[str],
+    segment_qc: Dict[str, Dict[str, Any]],
+) -> None:
+    """Persist union bad channels plus per-unit details for downstream QC."""
+    payload = {
+        "bad_channels": all_bads,
+        "by_unit": {
+            label: {
+                "display_name": info["display_name"],
+                "segments": list(info["segment_names"]),
+                "bad_channels": list(info["bads"]),
+                "artifact_seconds": float(info["artifact_seconds"]),
+            }
+            for label, info in segment_qc.items()
+        },
+    }
+    (subject_qc_dir(subj_id) / "bad_channels.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8",
+    )
+
+
+def write_unit_data_back(
+    raw_target: mne.io.Raw,
+    cleaned_unit: mne.io.Raw,
+    segments: List[Dict[str, Any]],
+    segment_lengths: List[int],
+) -> None:
+    """Write concatenated unit data back into the corresponding time spans."""
+    sfreq = raw_target.info["sfreq"]
+    src_start = 0
+    for seg, seg_len in zip(segments, segment_lengths):
+        tgt_start = int(round(seg["start"] * sfreq))
+        tgt_stop = tgt_start + seg_len
+        src_stop = src_start + seg_len
+        raw_target._data[:, tgt_start:tgt_stop] = cleaned_unit.get_data(start=src_start, stop=src_stop)
+        src_start = src_stop
 
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1582,8 @@ def inspect_and_mark_segment(
         max_sec = f"  [first {LB_MAX_SEC:.0f}s]"
     elif seg_type == "Recov" and apply_time_rules:
         max_sec = f"  [first {RECOV_MAX_SEC:.0f}s]"
+    elif seg_type == "BH" and apply_time_rules:
+        max_sec = f"  [last {BH_TRIM_END_SEC:.0f}s excluded]"
     
     print("=" * 70)
     print(f"  Subject {subj_id} -- {tag.upper()}: {seg_type}{max_sec}")
@@ -1339,6 +1611,7 @@ def print_preprocessing_summary(
     segments: Dict[str, List[Tuple[float, Optional[float]]]],
     bad_channels: List[str],
     ica_info: Dict[str, Any],
+    segment_qc: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """
     Print and return a summary of preprocessing results.
@@ -1356,6 +1629,9 @@ def print_preprocessing_summary(
             orig_dur = end - start
             trunc_start, trunc_end = apply_segment_rules(seg_type, start, end)
             final_dur = trunc_end - trunc_start
+            qc_key = "BH" if seg_type == "BH" and segment_qc and "BH" in segment_qc else seg_name
+            qc_info = (segment_qc or {}).get(qc_key, {})
+            qc_bads = ", ".join(qc_info.get("bads", [])) if qc_info.get("bads") else "-"
 
             # Count BAD annotations within this segment
             bad_time = 0.0
@@ -1374,6 +1650,7 @@ def print_preprocessing_summary(
                 "Final (s)": f"{final_dur:.1f}",
                 "BAD time (s)": f"{bad_time:.1f}",
                 "Usable (s)": f"{max(0, final_dur - bad_time):.1f}",
+                "Bad channels": qc_bads,
                 "Inspected": "Yes" if SEGMENTS_INSPECTED.get(seg_type, False) else "No",
             })
 
@@ -1392,6 +1669,7 @@ def save_and_report_clean(
     segments: Dict[str, List[Tuple[float, Optional[float]]]],
     bad_channels: List[str],
     ica_info: Dict[str, Any],
+    segment_qc: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """
     Print summary, save cleaned data, and save summary CSV.
@@ -1401,7 +1679,7 @@ def save_and_report_clean(
         return
 
     df_summary = print_preprocessing_summary(
-        raw_clean, subj_id, segments, bad_channels, ica_info
+        raw_clean, subj_id, segments, bad_channels, ica_info, segment_qc
     )
 
     # Save cleaned data
@@ -1417,318 +1695,7 @@ def save_and_report_clean(
         summary_path = subject_qc_dir(subj_id) / "preprocessing_summary.csv"
         df_summary.to_csv(summary_path, index=False)
         print(f"  Summary saved -> {summary_path}\n")
-    print(">>> Proceed to Cell 7 for spectral analysis.\n")
-
-
-# ---------------------------------------------------------------------------
-# 1.12d  AGGREGATION FUNCTIONS
-# ---------------------------------------------------------------------------
-
-def aggregate_subject_excels(excel_dir: Path = EXCEL_DIR) -> Optional[Path]:
-    """
-    Aggregate all per-subject Excel files into a single global Excel.
-
-    Returns the path to the global Excel file, or None if no files found.
-    """
-    subject_excels = list(excel_dir.glob("subject_*_eeg_bandpower.xlsx"))
-
-    if not subject_excels:
-        print("  No per-subject Excel files found.")
-        return None
-
-    print(f"  Found {len(subject_excels)} subject files")
-
-    all_long, all_seg_avg, all_region_avg = [], [], []
-    all_qc_mk, all_qc_bad, all_qc_ica, all_qc_retention = [], [], [], []
-
-    for excel_path in sorted(subject_excels):
-        try:
-            xl = pd.ExcelFile(excel_path)
-            if "bandpower_long" in xl.sheet_names:
-                all_long.append(pd.read_excel(xl, "bandpower_long"))
-            if "bandpower_segment_avg" in xl.sheet_names:
-                all_seg_avg.append(pd.read_excel(xl, "bandpower_segment_avg"))
-            if "bandpower_region_avg" in xl.sheet_names:
-                all_region_avg.append(pd.read_excel(xl, "bandpower_region_avg"))
-            if "qc_markers" in xl.sheet_names:
-                all_qc_mk.append(pd.read_excel(xl, "qc_markers"))
-            if "qc_bad_channels" in xl.sheet_names:
-                all_qc_bad.append(pd.read_excel(xl, "qc_bad_channels"))
-            if "qc_ica" in xl.sheet_names:
-                all_qc_ica.append(pd.read_excel(xl, "qc_ica"))
-            if "qc_retention" in xl.sheet_names:
-                all_qc_retention.append(pd.read_excel(xl, "qc_retention"))
-        except Exception as e:
-            print(f"    Error reading {excel_path.name}: {e}")
-
-    # Concatenate
-    df_long = pd.concat(all_long, ignore_index=True) if all_long else pd.DataFrame()
-    df_seg = pd.concat(all_seg_avg, ignore_index=True) if all_seg_avg else pd.DataFrame()
-    df_region = pd.concat(all_region_avg, ignore_index=True) if all_region_avg else pd.DataFrame()
-    df_qc_mk = pd.concat(all_qc_mk, ignore_index=True) if all_qc_mk else pd.DataFrame()
-    df_qc_bad = pd.concat(all_qc_bad, ignore_index=True) if all_qc_bad else pd.DataFrame()
-    df_qc_ica = pd.concat(all_qc_ica, ignore_index=True) if all_qc_ica else pd.DataFrame()
-    df_qc_retention = pd.concat(all_qc_retention, ignore_index=True) if all_qc_retention else pd.DataFrame()
-
-    # Save global Excel
-    global_excel = excel_dir / "all_subjects_eeg_bandpower.xlsx"
-    with pd.ExcelWriter(global_excel, engine="openpyxl") as writer:
-        if not df_long.empty:
-            df_long.to_excel(writer, sheet_name="bandpower_long", index=False)
-        if not df_seg.empty:
-            df_seg.to_excel(writer, sheet_name="bandpower_segment_avg", index=False)
-        if not df_region.empty:
-            df_region.to_excel(writer, sheet_name="bandpower_region_avg", index=False)
-        if not df_qc_mk.empty:
-            df_qc_mk.to_excel(writer, sheet_name="qc_markers", index=False)
-        if not df_qc_bad.empty:
-            df_qc_bad.to_excel(writer, sheet_name="qc_bad_channels", index=False)
-        if not df_qc_ica.empty:
-            df_qc_ica.to_excel(writer, sheet_name="qc_ica", index=False)
-        if not df_qc_retention.empty:
-            df_qc_retention.to_excel(writer, sheet_name="qc_retention", index=False)
-
-    n_subjects = df_long["subject"].nunique() if not df_long.empty else 0
-    print(f"  Global Excel: {global_excel}")
-    print(f"  Total subjects: {n_subjects}, Total rows: {len(df_long):,}")
-
-    return global_excel
-
-
-# ---------------------------------------------------------------------------
-# 1.12e  TOPOGRAPHIC MAPS
-# ---------------------------------------------------------------------------
-
-def create_topomap_info() -> mne.Info:
-    """
-    Create an MNE Info object with standard 10-20 montage positions
-    for our EEG channels (excluding TP9 which is used as EOG).
-    """
-    # Create info with our EEG channels
-    info = mne.create_info(ch_names=EEG_CHANNELS, sfreq=1000, ch_types="eeg")
-    montage = mne.channels.make_standard_montage("standard_1020")
-    info.set_montage(montage)
-    return info
-
-
-def plot_subject_topomaps(
-    df_seg_avg: pd.DataFrame,
-    subj_id: Union[int, str],
-    save_dir: Optional[Path] = None,
-    power_type: str = "abs_power_mean",
-) -> None:
-    """
-    Create topographic maps for a single subject showing spectral power
-    per segment type and frequency band.
-
-    Creates ONE figure per segment type (rows=1, cols=bands).
-    Each figure is saved to disk and displayed.
-
-    Parameters
-    ----------
-    df_seg_avg : DataFrame with columns: subject, seg_type, channel, band, power
-    subj_id    : subject identifier
-    save_dir   : directory to save figures (if None, just displays)
-    power_type : "abs_power_mean" or "rel_power_mean"
-    """
-    # Robust subject filter (handles str/int mismatch)
-    df = df_seg_avg[df_seg_avg["subject"].astype(str) == str(subj_id)].copy()
-    if df.empty:
-        print(f"  No data for subject {subj_id}")
-        return
-
-    info = create_topomap_info()
-    seg_types = [s for s in ["LB", "BH", "Recov"] if s in df["seg_type"].values]
-    bands = list(FREQ_BANDS.keys())
-    unit = "µV²/Hz" if power_type == "abs_power_mean" else "ratio"
-
-    if not seg_types:
-        print(f"  No segments found for subject {subj_id}")
-        return
-
-    for seg_type in seg_types:
-        df_seg = df[df["seg_type"] == seg_type]
-        if df_seg.empty:
-            continue
-
-        n_bands = len(bands)
-        fig, axes = plt.subplots(1, n_bands, figsize=(3.8 * n_bands, 4.5))
-        if n_bands == 1:
-            axes = [axes]
-
-        fig.suptitle(f"Subject {subj_id} — {seg_type}", fontsize=14, fontweight="bold")
-
-        for i, band in enumerate(bands):
-            df_band = df_seg[df_seg["band"] == band]
-            data = np.zeros(len(EEG_CHANNELS))
-            for j, ch in enumerate(EEG_CHANNELS):
-                ch_vals = df_band[df_band["channel"] == ch][power_type]
-                if not ch_vals.empty:
-                    data[j] = float(ch_vals.mean())  # average across seg_idx
-
-            ax = axes[i]
-            try:
-                im, _ = mne.viz.plot_topomap(
-                    data, info, axes=ax, show=False,
-                    cmap="RdBu_r", contours=6,
-                )
-                ax.set_title(f"{band}\n({FREQ_BANDS[band][0]}-{FREQ_BANDS[band][1]} Hz)",
-                             fontsize=10)
-                cbar = fig.colorbar(im, ax=ax, orientation="horizontal",
-                                    fraction=0.06, pad=0.08, aspect=18, shrink=0.85)
-                cbar.ax.tick_params(labelsize=6)
-                cbar.set_label(unit, fontsize=7)
-            except Exception as e:
-                ax.text(0.5, 0.5, f"Error:\n{str(e)[:40]}", ha="center",
-                        va="center", transform=ax.transAxes, fontsize=8)
-                ax.set_title(band)
-
-        fig.subplots_adjust(left=0.03, right=0.97, bottom=0.15, top=0.85, wspace=0.4)
-
-        # Save to file
-        if save_dir is not None:
-            save_dir.mkdir(parents=True, exist_ok=True)
-            fig_path = save_dir / f"topomap_S{subj_id}_{seg_type}.png"
-            fig.savefig(str(fig_path), dpi=150, bbox_inches="tight")
-            print(f"    Saved: {fig_path.name}")
-
-        # Display — use IPython display() so all figures show (not just the last)
-        try:
-            from IPython.display import display
-            display(fig)
-        except ImportError:
-            plt.show()
-        plt.close(fig)
-
-
-def plot_subject_topomaps_comparison(
-    df_seg_avg: pd.DataFrame,
-    subj_id: Union[int, str],
-    save_dir: Optional[Path] = None,
-    power_type: str = "abs_power_mean",
-    robust_percentile: float = 2.0,
-) -> None:
-    """
-    Create a single comparison grid: rows = segment types, columns = bands.
-    One colorbar per band column at the bottom.
-
-    Uses **robust percentile-based clipping** (default 2nd–98th percentile)
-    so that outlier values in one segment do not squash the colour range for
-    all other segments.
-
-    Parameters
-    ----------
-    robust_percentile : float
-        Lower percentile for vlim (upper = 100 - robust_percentile).
-        Set to 0 to use plain min/max (not recommended).
-    """
-    # Robust subject filter
-    df = df_seg_avg[df_seg_avg["subject"].astype(str) == str(subj_id)].copy()
-    if df.empty:
-        print(f"  No data for subject {subj_id}")
-        return
-
-    info = create_topomap_info()
-    seg_types = [s for s in ["LB", "BH", "Recov"] if s in df["seg_type"].values]
-    bands = list(FREQ_BANDS.keys())
-    unit = "µV²/Hz" if power_type == "abs_power_mean" else "proportion"
-
-    if not seg_types:
-        print(f"  No segments found for subject {subj_id}")
-        return
-
-    n_rows = len(seg_types)
-    n_cols = len(bands)
-
-    # --- Build a data matrix so we can compute robust colour limits ----------
-    # data_matrix[band] = 2-D array (n_segs × n_channels)
-    data_matrix: Dict[str, np.ndarray] = {}
-    for band in bands:
-        mat = np.zeros((n_rows, len(EEG_CHANNELS)))
-        for ri, seg_type in enumerate(seg_types):
-            df_seg = df[df["seg_type"] == seg_type]
-            df_band = df_seg[df_seg["band"] == band]
-            for ci, ch in enumerate(EEG_CHANNELS):
-                ch_vals = df_band[df_band["channel"] == ch][power_type]
-                if not ch_vals.empty:
-                    mat[ri, ci] = float(ch_vals.mean())
-        data_matrix[band] = mat
-
-    # Robust percentile-based colour limits per band (across all segments)
-    band_vmin, band_vmax = {}, {}
-    for band in bands:
-        vals = data_matrix[band].ravel()
-        if robust_percentile > 0 and len(vals) > 0:
-            band_vmin[band] = float(np.percentile(vals, robust_percentile))
-            band_vmax[band] = float(np.percentile(vals, 100.0 - robust_percentile))
-        else:
-            band_vmin[band] = float(vals.min()) if len(vals) else 0
-            band_vmax[band] = float(vals.max()) if len(vals) else 1
-        # Safety: ensure vmin < vmax
-        if band_vmax[band] <= band_vmin[band]:
-            band_vmax[band] = band_vmin[band] + 1e-6
-
-    # --- Create figure -------------------------------------------------------
-    fig = plt.figure(figsize=(3.5 * n_cols, 3.2 * n_rows + 1.5))
-    gs = fig.add_gridspec(n_rows + 1, n_cols,
-                          height_ratios=[1] * n_rows + [0.06],
-                          hspace=0.35, wspace=0.30,
-                          left=0.06, right=0.96, top=0.92, bottom=0.04)
-
-    fig.suptitle(f"Subject {subj_id} — Spectral Power Comparison  ({unit})",
-                 fontsize=14, fontweight="bold")
-
-    band_images: Dict[str, Any] = {}
-
-    for row_i, seg_type in enumerate(seg_types):
-        for col_i, band in enumerate(bands):
-            ax = fig.add_subplot(gs[row_i, col_i])
-            data = data_matrix[band][row_i]
-
-            try:
-                im, _ = mne.viz.plot_topomap(
-                    data, info, axes=ax, show=False,
-                    cmap="RdBu_r", contours=4,
-                    vlim=(band_vmin[band], band_vmax[band]),
-                )
-                if band not in band_images:
-                    band_images[band] = im
-            except Exception:
-                ax.text(0.5, 0.5, "N/A", ha="center", va="center",
-                        transform=ax.transAxes)
-
-            # Column titles (top row only)
-            if row_i == 0:
-                ax.set_title(f"{band}\n({FREQ_BANDS[band][0]}-{FREQ_BANDS[band][1]} Hz)",
-                             fontsize=10)
-            # Row labels (left column only)
-            if col_i == 0:
-                ax.text(-0.15, 0.5, seg_type, transform=ax.transAxes,
-                        fontsize=12, fontweight="bold", va="center", ha="right")
-
-    # Colorbar row at the bottom
-    for col_i, band in enumerate(bands):
-        cax = fig.add_subplot(gs[n_rows, col_i])
-        if band in band_images:
-            fig.colorbar(band_images[band], cax=cax, orientation="horizontal")
-            cax.tick_params(labelsize=6)
-        else:
-            cax.set_visible(False)
-
-    # Save to file
-    if save_dir is not None:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "abs" if "abs" in power_type else "rel"
-        fig_path = save_dir / f"topomap_comparison_{suffix}_S{subj_id}.png"
-        fig.savefig(str(fig_path), dpi=150, bbox_inches="tight")
-        print(f"    Saved: {fig_path.name}")
-
-    try:
-        from IPython.display import display
-        display(fig)
-    except ImportError:
-        plt.show()
-    plt.close(fig)
+    print(">>> Preprocessing finished. Run `eeg_spectral_analysis.py` for downstream analyses.\n")
 
 
 def plot_segment_overview(
@@ -1766,12 +1733,12 @@ def plot_segment_overview(
 
     # -- Bottom: PSD --
     ax = axes[1]
-    n_fft = min(WELCH_N_FFT, data.shape[1])
-    n_overlap = min(WELCH_N_OVERLAP, n_fft - 1)
+    n_fft = min(INSPECT_PSD_N_FFT, data.shape[1])
+    n_overlap = min(INSPECT_PSD_N_OVERLAP, n_fft - 1)
     try:
         psd, freqs = mne.time_frequency.psd_array_welch(
             data * 1e-6,  # back to V for MNE
-            sfreq=sfreq, fmin=PSD_FMIN, fmax=PSD_FMAX,
+            sfreq=sfreq, fmin=INSPECT_PSD_FMIN, fmax=INSPECT_PSD_FMAX,
             n_fft=n_fft, n_overlap=n_overlap, verbose=False,
         )
         psd_uv2 = psd * 1e12  # V^2/Hz -> uV^2/Hz
@@ -1882,13 +1849,47 @@ def launch_interactive_viewer(
             if ch not in raw.info["bads"]:
                 raw.info["bads"].append(ch)
 
-        # BAD annotations (absolute times already)
-        for ann in edits.get("annotations_added", []):
-            raw.annotations.append(
-                onset=ann["onset"],
-                duration=ann["duration"],
-                description=ann["description"],
+        # BAD annotations: use annotations_final (full replacement) if available,
+        # otherwise fall back to annotations_added (append-only, legacy behaviour).
+        seg_tmin = edits.get("segment_tmin", start)
+        seg_tmax = edits.get("segment_tmax", end)
+        annotations_final = edits.get("annotations_final")
+
+        if annotations_final is not None:
+            # Remove all existing BAD annotations that overlap this segment
+            keep = []
+            for ann in raw.annotations:
+                if ann["description"].upper().startswith("BAD"):
+                    ann_start = float(ann["onset"])
+                    ann_end = ann_start + float(ann["duration"])
+                    if ann_end > seg_tmin and ann_start < seg_tmax:
+                        continue
+                keep.append(ann)
+
+            new_annotations = mne.Annotations(
+                onset=[float(a["onset"]) for a in keep],
+                duration=[float(a["duration"]) for a in keep],
+                description=[a["description"] for a in keep],
+                orig_time=raw.annotations.orig_time,
             )
+
+            # Add back BAD annotations as they are after the user edited them
+            for ann in annotations_final:
+                new_annotations.append(
+                    onset=ann["onset"],
+                    duration=ann["duration"],
+                    description=ann["description"],
+                )
+
+            raw.set_annotations(new_annotations)
+        else:
+            # Legacy: only add new annotations
+            for ann in edits.get("annotations_added", []):
+                raw.annotations.append(
+                    onset=ann["onset"],
+                    duration=ann["duration"],
+                    description=ann["description"],
+                )
 
     return edits
 
@@ -1905,6 +1906,7 @@ def apply_segment_rules(
 
     - LB / Recov : keep at most 300 s from start.
     - BH         : drop the last 10 s.
+    - CPT        : no cap — all available data is used.
     """
     if end is None:
         return start, start
@@ -1920,452 +1922,40 @@ def apply_segment_rules(
     return start, end
 
 
-def make_windows(
-    start: float, end: float, win_sec: float = WINDOW_SEC,
-) -> List[Tuple[float, float]]:
-    """
-    Divide ``[start, end)`` into non-overlapping windows of ``win_sec``.
-    The last window may be shorter.
-    """
-    if end <= start:
-        return []
-    wins: List[Tuple[float, float]] = []
-    t = start
-    while t + win_sec <= end + 0.001:
-        wins.append((t, min(t + win_sec, end)))
-        t += win_sec
-    if t < end - 0.001:
-        wins.append((t, end))
-    return wins
-
-
-# ---------------------------------------------------------------------------
-# 1.14  SPECTRAL ANALYSIS
-# ---------------------------------------------------------------------------
-
-def compute_bandpower_welch(
-    data: np.ndarray,
-    sfreq: float,
-    bands: Dict[str, Tuple[float, float]] = FREQ_BANDS,
-    n_fft: int = WELCH_N_FFT,
-    n_overlap: int = WELCH_N_OVERLAP,
-    fmin: float = PSD_FMIN,
-    fmax: float = PSD_FMAX,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    """
-    Welch PSD -> absolute and relative band power.
-
-    Parameters
-    ----------
-    data : (n_channels, n_times) in **Volts**
-
-    Returns
-    -------
-    abs_power : {band: (n_channels,)}  in **uV^2**
-    rel_power : {band: (n_channels,)}  dimensionless (0-1)
-    """
-    n_times = data.shape[1]
-    eff_nfft = min(n_fft, n_times)
-    eff_noverlap = min(n_overlap, eff_nfft - 1)
-
-    psd, freqs = mne.time_frequency.psd_array_welch(
-        data, sfreq=sfreq, fmin=fmin, fmax=fmax,
-        n_fft=eff_nfft, n_overlap=eff_noverlap, verbose=False,
-    )
-    df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
-
-    total = np.sum(psd, axis=1) * df
-    abs_p: Dict[str, np.ndarray] = {}
-    rel_p: Dict[str, np.ndarray] = {}
-    for bname, (blow, bhigh) in bands.items():
-        mask = (freqs >= blow) & (freqs < bhigh)
-        bp = np.sum(psd[:, mask], axis=1) * df
-        abs_p[bname] = bp * 1e12
-        rel_p[bname] = np.where(total > 0, bp / total, 0.0)
-    return abs_p, rel_p
-
-
-# ---------------------------------------------------------------------------
-# 1.15  PROCESS ONE SEGMENT'S WINDOWS -> result rows
-# ---------------------------------------------------------------------------
-
-def window_overlaps_bad(
-    raw: mne.io.Raw,
-    win_start: float,
-    win_end: float,
-    threshold: float = BAD_OVERLAP_THRESHOLD,
-) -> bool:
-    """
-    Return True if the fraction of BAD time within [win_start, win_end]
-    exceeds ``threshold``.
-
-    With threshold=0.25 (default), a 30 s window is rejected only if more
-    than 7.5 s of it is covered by BAD annotations. Small, isolated BAD
-    marks (e.g., 0.2 s blink artefacts) do NOT cause the whole window to
-    be discarded.
-    """
-    win_dur = win_end - win_start
-    if win_dur <= 0:
-        return True
-
-    bad_total = 0.0
-    for ann in raw.annotations:
-        if "BAD" not in ann["description"].upper():
-            continue
-        a_start = ann["onset"]
-        a_end = a_start + ann["duration"]
-        # Overlap duration
-        ov_start = max(a_start, win_start)
-        ov_end = min(a_end, win_end)
-        if ov_end > ov_start:
-            bad_total += ov_end - ov_start
-
-    return (bad_total / win_dur) > threshold
-
-
-def process_segment_windows(
-    raw: mne.io.Raw,
-    subj_id: Union[int, str],
-    seg_type: str,
-    seg_idx: int,
-    start: float,
-    end: Optional[float],
-    eeg_ch_names: List[str],
-) -> List[Dict[str, Any]]:
-    """Return a list of flat dicts (one per channel x band x window).
-    Windows where BAD time exceeds BAD_OVERLAP_THRESHOLD are skipped.
-    """
-    adj_s, adj_e = apply_segment_rules(seg_type, start, end)
-    if adj_e <= adj_s:
-        logger.warning(
-            f"S{subj_id} | {seg_type} {seg_idx}: 0-duration after rules, skip"
-        )
-        return []
-
-    windows = make_windows(adj_s, adj_e)
-    if not windows:
-        return []
-
-    sfreq = raw.info["sfreq"]
-    eeg_picks = mne.pick_channels(raw.ch_names, eeg_ch_names)
-    rows: List[Dict[str, Any]] = []
-    n_skipped = 0
-
-    for wi, (ws, we) in enumerate(windows):
-        # Skip windows where BAD fraction > BAD_OVERLAP_THRESHOLD
-        if window_overlaps_bad(raw, ws, we):
-            n_skipped += 1
-            continue
-        i0, i1 = int(ws * sfreq), int(we * sfreq)
-        if i1 <= i0:
-            continue
-        i1 = min(i1, raw.n_times)
-        data = raw.get_data(picks=eeg_picks, start=i0, stop=i1)
-
-        win_dur = (i1 - i0) / sfreq
-        flag = ""
-        if win_dur < WINDOW_SEC - 0.5:
-            flag = "short_window"
-
-        if APPLY_DETREND:
-            from scipy.signal import detrend
-            data = detrend(data, axis=1, type="linear")
-
-        ptp_uv = (data.max(axis=1) - data.min(axis=1)) * 1e6
-        if ptp_uv.max() > ARTIFACT_PTP_THRESH_UV:
-            flag = f"{flag};high_ptp" if flag else "high_ptp"
-
-        abs_p, rel_p = compute_bandpower_welch(data, sfreq)
-
-        for ci, ch in enumerate(eeg_ch_names):
-            if ci >= data.shape[0]:
-                break
-            for bname in FREQ_BANDS:
-                rows.append({
-                    "subject":        subj_id,
-                    "seg_type":       seg_type,
-                    "seg_idx":        seg_idx,
-                    "win_idx":        wi,
-                    "channel":        ch,
-                    "band":           bname,
-                    "abs_power_uV2":  float(abs_p[bname][ci]),
-                    "rel_power":      float(rel_p[bname][ci]),
-                    "win_start_s":    ws,
-                    "win_end_s":      we,
-                    "win_duration_s": win_dur,
-                    "flag":           flag,
-                })
-
-    n_kept = len(windows) - n_skipped
-    logger.info(
-        f"S{subj_id} | {seg_type} {seg_idx}: "
-        f"{len(windows)} win total, {n_kept} kept, {n_skipped} rejected "
-        f"(>{BAD_OVERLAP_THRESHOLD:.0%} BAD), {len(rows)} rows"
-    )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 1.16  SPECTRAL DRIVER  (process all segments for one subject)
-# ---------------------------------------------------------------------------
-
-def process_all_segments_spectral(
-    raw: mne.io.Raw,
-    subj_id: Union[int, str],
-    segments: Dict[str, List[Tuple[float, Optional[float]]]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Loop over all segment types and intervals, compute band power.
-
-    Returns
-    -------
-    all_rows : list of flat dicts (one per channel x band x window)
-    retention_records : list of per-segment retention dicts, each with keys
-        subject, seg_type, seg_idx, n_windows_total, n_windows_kept,
-        retention_pct, low_retention_flag
-    """
-    avail_eeg = [ch for ch in EEG_CHANNELS if ch in raw.ch_names]
-    all_rows: List[Dict[str, Any]] = []
-    retention_records: List[Dict[str, Any]] = []
-
-    for seg_idx, seg_type in enumerate(("LB", "BH", "Recov"), start=1):
-        intervals = segments.get(seg_type, [])
-        if not intervals:
-            print(f"  {seg_type:<8s}:  no segments found")
-            continue
-
-        # Progress indicator for segment type
-        print(f"  Processing {seg_type}... ", end="", flush=True)
-
-        seg_rows: List[Dict[str, Any]] = []
-        n_intervals = len(intervals)
-        for si, (start, end) in enumerate(intervals, start=1):
-            if end is None:
-                print(f"\n    {seg_type} {si}: unpaired marker, skip")
-                continue
-            # Show interval progress for segment types with multiple intervals
-            if n_intervals > 1:
-                print(f"[{si}/{n_intervals}] ", end="", flush=True)
-            rows = process_segment_windows(
-                raw, subj_id, seg_type, si, start, end, avail_eeg,
-            )
-            seg_rows.extend(rows)
-
-            # Compute retention for this interval
-            adj_s, adj_e = apply_segment_rules(seg_type, start, end)
-            n_total = len(make_windows(adj_s, adj_e))
-            # n_kept = unique win_idx values returned for this (seg_type, seg_idx)
-            n_kept = len({r["win_idx"] for r in rows})
-            ret_pct = (n_kept / n_total * 100.0) if n_total > 0 else 0.0
-            retention_records.append({
-                "subject":          subj_id,
-                "seg_type":         seg_type,
-                "seg_idx":          si,
-                "n_windows_total":  n_total,
-                "n_windows_kept":   n_kept,
-                "retention_pct":    round(ret_pct, 1),
-                "low_retention":    ret_pct < 50.0 and n_total > 0,
-            })
-
-        n_win = len({(r["seg_idx"], r["win_idx"]) for r in seg_rows})
-        print(f"done  ({len(intervals)} interval(s), {n_win} window(s) kept, {len(seg_rows)} rows)")
-        if n_win == 0 and len(intervals) > 0:
-            print(f"    !! All windows rejected (>{BAD_OVERLAP_THRESHOLD:.0%} BAD). "
-                  f"Consider increasing BAD_OVERLAP_THRESHOLD.")
-        all_rows.extend(seg_rows)
-
-    # Warn about low-retention segments
-    low_ret = [r for r in retention_records if r["low_retention"]]
-    if low_ret:
-        print(f"\n  !! LOW RETENTION WARNING (< 50% windows kept):")
-        for r in low_ret:
-            print(f"     {r['seg_type']} {r['seg_idx']}: "
-                  f"{r['n_windows_kept']}/{r['n_windows_total']} windows "
-                  f"({r['retention_pct']:.1f}%) — spectral estimates unreliable")
-
-    return all_rows, retention_records
-
-
-def _save_segment_epochs(
-    raw: mne.io.Raw,
-    subj_id: Union[int, str],
-    seg_type: str,
-    intervals: List[Tuple[float, Optional[float]]],
-    eeg_chs: List[str],
-) -> None:
-    """Save 30-s Epochs per segment for traceability (optional)."""
-    sfreq = raw.info["sfreq"]
-    events_list = []
-    for si, (start, end) in enumerate(intervals, start=1):
-        if end is None:
-            continue
-        adj_s, adj_e = apply_segment_rules(seg_type, start, end)
-        for ws, we in make_windows(adj_s, adj_e):
-            if we - ws >= WINDOW_SEC - 0.5:
-                events_list.append([int(ws * sfreq), 0, si])
-    if not events_list:
-        return
-    events = np.array(events_list, dtype=int)
-    try:
-        epochs = mne.Epochs(
-            raw, events, tmin=0, tmax=WINDOW_SEC - 1 / sfreq,
-            baseline=None, preload=True, picks=eeg_chs, verbose=False,
-        )
-        out = subject_fif_dir(subj_id) / f"epochs_{seg_type}-epo.fif"
-        epochs.save(str(out), overwrite=OVERWRITE_FIF, verbose=False)
-        logger.debug(f"S{subj_id} | Saved {out.name}")
-    except Exception as exc:
-        logger.warning(f"S{subj_id} | Epochs save failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# 1.17  AGGREGATION
-# ---------------------------------------------------------------------------
-
-def compute_segment_averages(df: pd.DataFrame) -> pd.DataFrame:
-    """Average band power across windows -> one row per segment x channel x band."""
-    grp = ["subject", "seg_type", "seg_idx", "channel", "band"]
-    return (
-        df.groupby(grp, as_index=False)
-        .agg(
-            abs_power_mean=("abs_power_uV2", "mean"),
-            rel_power_mean=("rel_power", "mean"),
-            n_windows=("win_idx", "nunique"),
-        )
-    )
-
-
-def compute_region_averages(
-    df_seg: pd.DataFrame,
-    region_map: Dict[str, List[str]] = REGION_MAP,
-) -> pd.DataFrame:
-    """Average segment-level band power across channels within each region."""
-    rows: List[Dict[str, Any]] = []
-    grp_cols = ["subject", "seg_type", "seg_idx", "band"]
-    for _, g in df_seg.groupby(grp_cols):
-        for region, chs in region_map.items():
-            mask = g["channel"].isin(chs)
-            if mask.sum() == 0:
-                continue
-            sub = g.loc[mask]
-            rows.append({
-                "subject":        g["subject"].iloc[0],
-                "seg_type":       g["seg_type"].iloc[0],
-                "seg_idx":        g["seg_idx"].iloc[0],
-                "band":           g["band"].iloc[0],
-                "region":         region,
-                "abs_power_mean": sub["abs_power_mean"].mean(),
-                "rel_power_mean": sub["rel_power_mean"].mean(),
-                "n_channels":     int(mask.sum()),
-                "n_windows":      int(sub["n_windows"].iloc[0]),
-            })
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# 1.18  QC DATAFRAMES
-# ---------------------------------------------------------------------------
-
-def build_qc_markers_df(
-    all_seg: Dict, 
-) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for sid, segs in all_seg.items():
-        for lab, ivs in segs.items():
-            for i, (s, e) in enumerate(ivs):
-                dur = (e - s) if e is not None else None
-                flag = ""
-                if e is None:
-                    flag = "unpaired"
-                elif dur is not None and dur <= 0:
-                    flag = "negative_duration"
-                elif dur is not None and dur < 2.0:
-                    flag = "very_short"
-                rows.append({
-                    "subject": sid, "seg_type": lab, "seg_idx": i + 1,
-                    "start_s": s, "end_s": e, "duration_s": dur, "flag": flag,
-                })
-    return pd.DataFrame(rows)
-
-
-def build_qc_bad_channels_df(
-    all_bads: Dict,
-) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for sid, bads in all_bads.items():
-        if bads:
-            for ch in bads:
-                rows.append({"subject": sid, "bad_channel": ch, "interpolated": True})
-        else:
-            rows.append({"subject": sid, "bad_channel": "none", "interpolated": False})
-    return pd.DataFrame(rows)
-
-
-def build_qc_ica_df(
-    all_ica: Dict,
-) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for sid, info in all_ica.items():
-        rows.append({
-            "subject": sid,
-            "n_components": info.get("n_components", None),
-            "excluded_indices": str(info.get("excluded", [])),
-            "method": info.get("method", ICA_METHOD),
-            "figures_dir": str(subject_qc_dir(sid)),
-        })
-    return pd.DataFrame(rows)
-
-
-def build_qc_retention_df(
-    retention_records: List[Dict[str, Any]],
-) -> pd.DataFrame:
-    """Build a QC DataFrame summarising window retention per segment.
-
-    Columns
-    -------
-    subject, seg_type, seg_idx, n_windows_total, n_windows_kept,
-    retention_pct, low_retention
-
-    A ``low_retention`` flag (True) means < 50 % of windows survived cleaning.
-    Spectral estimates for flagged segments should be interpreted with caution.
-    """
-    if not retention_records:
-        return pd.DataFrame(columns=[
-            "subject", "seg_type", "seg_idx",
-            "n_windows_total", "n_windows_kept",
-            "retention_pct", "low_retention",
-        ])
-    return pd.DataFrame(retention_records)
-
-
-# ---------------------------------------------------------------------------
-# 1.19  EXCEL EXPORT
-# ---------------------------------------------------------------------------
-
-def export_excel(
-    df_long: pd.DataFrame,
-    df_seg: pd.DataFrame,
-    df_reg: pd.DataFrame,
-    df_qc_mk: pd.DataFrame,
-    df_qc_bad: pd.DataFrame,
-    df_qc_ica: pd.DataFrame,
-    path: Path,
-    df_qc_retention: Optional[pd.DataFrame] = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(str(path), engine="openpyxl") as w:
-        df_long.to_excel(w, sheet_name="bandpower_long", index=False)
-        df_seg.to_excel(w, sheet_name="bandpower_segment_avg", index=False)
-        df_reg.to_excel(w, sheet_name="bandpower_region_avg", index=False)
-        df_qc_mk.to_excel(w, sheet_name="qc_markers", index=False)
-        df_qc_bad.to_excel(w, sheet_name="qc_bad_channels", index=False)
-        df_qc_ica.to_excel(w, sheet_name="qc_ica", index=False)
-        if df_qc_retention is not None and not df_qc_retention.empty:
-            df_qc_retention.to_excel(w, sheet_name="qc_retention", index=False)
-    logger.info(f"Excel saved -> {path}")
-
-
 # ========================  END OF CELL 1  ==================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+# =================================================================================
+
+
+
 
 
 #%%
@@ -2386,10 +1976,10 @@ def export_excel(
 # =============================================================================
 
 # ============================================================================
-# >>> EDIT HERE: Subject ID and EEG file path <<<
+# >>> EDIT HERE: Subject ID (EEG file path is derived: participantes_eeg_bh/{SUJETO}eeg.vhdr)
 # ============================================================================
-SUJETO = "16"
-EEG_FILE = r"C:\Users\marag\Desktop\eeg_bh\participantes_eeg_bh\16eeg.vhdr"
+SUJETO = "3"
+EEG_FILE = INPUT_DIR / f"{SUJETO}eeg.vhdr"
 # ============================================================================
 
 # --- runtime initialisation ------------------------------------------------
@@ -2430,9 +2020,22 @@ ann_report = list_raw_annotations(RAW, SUJETO)
 
 # --- Reconstruct & inspect segments ----------------------------------------
 _label_onsets = parse_annotations(RAW)
+# If CPT (or another new type) is missing from the report below, re-run Cell 1 so updated _LABEL_NORMALIZE and reconstruct_segments are loaded.
 ALL_SEGMENTS: Dict[str, Dict[str, List[Tuple[float, Optional[float]]]]] = {}
 ALL_SEGMENTS[SUJETO] = reconstruct_segments(_label_onsets)
 save_segments_json(SUJETO, ALL_SEGMENTS[SUJETO])
+
+# --- Subject-specific segment exclusions (before Cell 3) --------------------
+# S7: Build Recov from first to last Recovery label (3287.26–3676.94 s) — one segment, then truncated to 300s by segment time rules
+if str(SUJETO) == "7":
+    recov_list = ALL_SEGMENTS[SUJETO].get("Recov", [])
+    if len(recov_list) >= 1:
+        # Original: [(3287.26, 3408.90), (3676.94, None)]. New: single interval first label → last label
+        start_new = recov_list[0][0]
+        end_new = recov_list[-1][0] if recov_list[-1][1] is None else recov_list[-1][1]
+        ALL_SEGMENTS[SUJETO]["Recov"] = [(start_new, end_new)]
+        save_segments_json(SUJETO, ALL_SEGMENTS[SUJETO])
+        print("  [S7] Recov = first to last Recovery label (single segment).\n")
 
 _seg_report = inspect_segments(SUJETO, ALL_SEGMENTS[SUJETO], RAW.info["sfreq"])
 (subject_qc_dir(SUJETO) / "segment_inspection.txt").write_text(
@@ -2450,8 +2053,6 @@ print(">>> before running Cell 3.\n")
 SEGMENTS_INSPECTED: Dict[str, bool] = {
     "LB": False, "BH": False, "Recov": False,
 }
-
-
 #%%
 # =============================================================================
 # CELL 3a — INSPECT RAW: LB (Baseline)
@@ -2477,29 +2078,51 @@ SEGMENTS_INSPECTED["LB"] = True
 # =============================================================================
 # CELL 3b — INSPECT RAW: BH (Breath Holds)
 # =============================================================================
-
 inspect_and_mark_segment(
     RAW, SUJETO, "BH", _segments,
-    tag="raw", interactive=INTERACTIVE_VIEW, apply_time_rules=False,
+    tag="raw", interactive=INTERACTIVE_VIEW, apply_time_rules=True,
 )
 SEGMENTS_INSPECTED["BH"] = True
+#%%
+# Set to True and run this cell if after inspecting BH you decided not to include it.
+EXCLUIR_BH = True
+SEGMENTS_INSPECTED["BH"] = not EXCLUIR_BH
 
 
 #%%
 # =============================================================================
-# CELL 3c — INSPECT RAW: Recov (Recovery)
+# CELL 3c — INSPECT RAW: CPT
 # =============================================================================
+inspect_and_mark_segment(
+    RAW, SUJETO, "CPT", _segments,
+    tag="raw", interactive=INTERACTIVE_VIEW, apply_time_rules=True,
+)
+SEGMENTS_INSPECTED["CPT"] = True
+#%%
+# Set to True and run this cell if after inspecting CPT you decided not to include it.
+EXCLUIR_CPT = False
+SEGMENTS_INSPECTED["CPT"] = not EXCLUIR_CPT
 
+
+#%%
+# =============================================================================
+# CELL 3d — INSPECT RAW: Recov (Recovery)
+# =============================================================================
 inspect_and_mark_segment(
     RAW, SUJETO, "Recov", _segments,
     tag="raw", interactive=INTERACTIVE_VIEW, apply_time_rules=True,
 )
 SEGMENTS_INSPECTED["Recov"] = True
+#%%
+# Set to True and run this cell if after inspecting Recov you decided not to include it.
+EXCLUIR_RECOV = True
+SEGMENTS_INSPECTED["Recov"] = not EXCLUIR_RECOV
+
 
 
 #%%
 # =============================================================================
-# CELL 3d — SUMMARY OF MANUAL EDITS
+# CELL 3e — SUMMARY OF MANUAL EDITS
 # =============================================================================
 
 print("=" * 70)
@@ -2515,6 +2138,8 @@ _total_bad = 0.0
 _total_dur = 0.0
 
 for _seg_type in ["LB", "BH", "Recov"]:
+    if not SEGMENTS_INSPECTED.get(_seg_type, True):
+        continue
     _segs = get_segments_by_type(_segments, _seg_type, apply_time_rules=True)
     for _seg_name, _seg_idx, _start, _end in _segs:
         _seg_dur = _end - _start
@@ -2546,22 +2171,33 @@ print(f"\n{_df_pre.to_string(index=False)}")
 
 _total_pct = (_total_bad / _total_dur * 100) if _total_dur > 0 else 0
 print(f"\n  Total: {_total_bad:.1f}s BAD out of {_total_dur:.1f}s ({_total_pct:.1f}%)")
+
+_excluded = [st for st in ["LB", "BH", "Recov", "CPT"] if not SEGMENTS_INSPECTED.get(st, True)]
+if _excluded:
+    print(f"\n  >> Excluded from downstream analysis: {', '.join(_excluded)}")
+else:
+    print(f"\n  >> All segments included for downstream analysis.")
 print("\n>>> Proceed to Cell 4 for preprocessing.\n")
 
 
 #%%
 # =============================================================================
-# CELL 4 — PREPROCESSING  (Steps 1-7)
+# CELL 4 — PREPROCESSING  (Steps 1-8)
 # =============================================================================
 # Runs the full signal-processing chain on the loaded raw:
 #   Step 1: Channel selection + types
 #   Step 2: Montage
-#   Step 3: Notch + bandpass filtering
-#   Step 4: Average re-reference
-#   Step 5: Bad-channel detection + interpolation (includes manual bads from Cell 3)
-#   Step 6: Gross-artifact annotation
-#   Step 7: ICA (EOG component removal)
+#   Step 3a: Filter ICA-fit dataset (1-40 Hz + notch)
+#   Step 3b: Filter final dataset (0.1-40 Hz + notch)
+#   Step 4: Detect bad channels by preprocessing unit (LB / BH / Recov)
+#   Step 5: Annotate gross artifacts by segment on the ICA-fit dataset
+#   Step 6: Fit ICA on concatenated analysis segments, apply to final dataset
+#   Step 7: Interpolate bad channels by preprocessing unit
+#   Step 8: Average re-reference by preprocessing unit
 #
+# Order follows Kim et al. 2023 / Klug et al. 2024 / Makoto's Pipeline.
+# This preserves low frequencies in the final cleaned signal while keeping the
+# ICA fit stable on a temporary high-pass-filtered copy.
 # Intermediate .fif files are saved after each step.
 # =============================================================================
 
@@ -2571,13 +2207,17 @@ print("=" * 70 + "\n")
 
 ALL_BAD_CHANNELS: Dict[str, List[str]] = {}
 ALL_ICA_INFO: Dict[str, Dict[str, Any]] = {}
+ALL_SEGMENT_QC: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 try:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        RAW_CLEAN, _bads, _ica_info = run_preprocessing_steps(RAW, SUJETO)
+        RAW_CLEAN, _bads, _ica_info, _segment_qc = run_preprocessing_steps(
+            RAW, SUJETO, ALL_SEGMENTS[SUJETO]
+        )
     ALL_BAD_CHANNELS[SUJETO] = _bads
     ALL_ICA_INFO[SUJETO] = _ica_info
+    ALL_SEGMENT_QC[SUJETO] = _segment_qc
     print(f"\n{'='*70}")
     print(f"  PREPROCESSING COMPLETE  --  Subject {SUJETO}")
     print(f"{'='*70}\n")
@@ -2585,6 +2225,52 @@ except Exception as _exc:
     print(f"\n!! PREPROCESSING FAILED: {_exc}")
     logger.error(f"S{SUJETO} | PREPROCESSING FAILED:\n{traceback.format_exc()}")
     RAW_CLEAN = None
+
+
+#%%
+# =============================================================================
+# OPTIONAL — ICA component time courses (LB only; QC / documentation)
+# =============================================================================
+# Loads saved ICA + step5_annotated_raw.fif (ICA-fit, same as ICA fit), crops to
+# LB (≤300 s), runs ica.plot_sources(). Red overlays = BAD annotations excluded
+# from ICA via reject_by_annotation. Requires SAVE_INTERMEDIATE_FIF and
+# SAVE_QC_FILES. ICA_SOURCES_PICKS: None = all components.
+# =============================================================================
+
+ICA_SOURCES_PICKS = None   # None = all; or e.g. [0, 1, 5] for ICA001, ICA002, ICA006
+
+if RAW_CLEAN is None:
+    print("!! Preprocessing did not complete. Run Cell 4 first.")
+else:
+    _step6_path = subject_fif_dir(SUJETO) / "step5_annotated_raw.fif"
+    if not _step6_path.exists():
+        print(
+            "!! ICA sources viewer: step5 raw not found. "
+            "Set SAVE_INTERMEDIATE_FIF = True and re-run Cell 4."
+        )
+    else:
+        _ica_path = subject_qc_dir(SUJETO) / "ica_solution-ica.fif"
+        if not _ica_path.exists():
+            print(
+                "!! ICA sources viewer: ICA solution not found. "
+                "Run Cell 4 with SAVE_QC_FILES = True."
+            )
+        else:
+            _ica = mne.preprocessing.read_ica(str(_ica_path), verbose=False)
+            _raw_pre_ica = mne.io.read_raw_fif(str(_step6_path), preload=True, verbose=False)
+            _lb_segs = get_segments_by_type(ALL_SEGMENTS[SUJETO], "LB", apply_time_rules=True)
+            if not _lb_segs:
+                print("!! LB segment not found in ALL_SEGMENTS. Check Cell 2.")
+            else:
+                _seg_name, _idx, _start, _end = _lb_segs[0]
+                _raw_lb = _raw_pre_ica.copy().crop(tmin=_start, tmax=_end)
+                print(
+                    f"  Optional ICA viewer — LB (baseline): "
+                    f"{_start:.1f}s – {_end:.1f}s ({_end - _start:.1f}s)"
+                )
+                # Interactive backend for scrollable MNE browser (PyQt5 recommended)
+                %matplotlib qt
+                _ica.plot_sources(_raw_lb, picks=ICA_SOURCES_PICKS, show=True, block=True)
 
 
 #%%
@@ -2615,7 +2301,7 @@ if RAW_CLEAN is None:
 else:
     inspect_and_mark_segment(
         RAW_CLEAN, SUJETO, "BH", ALL_SEGMENTS[SUJETO],
-        tag="clean", interactive=INTERACTIVE_VIEW_CLEAN, apply_time_rules=False,
+        tag="clean", interactive=INTERACTIVE_VIEW_CLEAN, apply_time_rules=True,
     )
 
 
@@ -2635,6 +2321,20 @@ else:
 
 #%%
 # =============================================================================
+# CELL 5d — INSPECT CLEANED: CPT
+# =============================================================================
+
+if RAW_CLEAN is None:
+    print("!! Cleaned data not available.")
+else:
+    inspect_and_mark_segment(
+        RAW_CLEAN, SUJETO, "CPT", ALL_SEGMENTS[SUJETO],
+        tag="clean", interactive=INTERACTIVE_VIEW_CLEAN, apply_time_rules=True,
+    )
+
+
+#%%
+# =============================================================================
 # CELL 6 — PREPROCESSING SUMMARY & SAVE CLEANED DATA
 # =============================================================================
 # Shows a summary table of all changes applied during preprocessing,
@@ -2645,179 +2345,20 @@ save_and_report_clean(
     RAW_CLEAN, SUJETO, ALL_SEGMENTS[SUJETO],
     ALL_BAD_CHANNELS.get(SUJETO, []),
     ALL_ICA_INFO.get(SUJETO, {}),
+    ALL_SEGMENT_QC.get(SUJETO, {}),
 )
 
 
 #%%
 # =============================================================================
-# CELL 7 — SPECTRAL POWER COMPUTATION  (only inspected segments)
+# DOWNSTREAM ANALYSIS
 # =============================================================================
-# Computes Welch PSD band power ONLY for segments that were inspected.
-# This ensures the Excel output contains only cleaned data.
-# =============================================================================
-
-# Load cleaned data if not already in memory
-if "RAW_CLEAN" not in dir() or RAW_CLEAN is None:
-    print("  Loading cleaned data from disk...")
-    RAW_CLEAN = load_clean_data(SUJETO)
-
-if RAW_CLEAN is None:
-    print("!! Cleaned data not available. Run preprocessing first.")
-else:
-    # Filter segments to only those that were inspected
-    _inspected_types = [k for k, v in SEGMENTS_INSPECTED.items() if v]
-    if not _inspected_types:
-        print("!! No segments were inspected. Run Cell 3a-3d first.")
-        ALL_RESULTS = []
-        ALL_RETENTION = []
-    else:
-        print("=" * 70)
-        print(f"  Subject {SUJETO} -- Spectral band-power computation")
-        print(f"  Segments: {_inspected_types}")
-        print("=" * 70 + "\n")
-
-        # Build filtered segments dict with only inspected types
-        _filtered_segments = {
-            k: v for k, v in ALL_SEGMENTS[SUJETO].items()
-            if k in _inspected_types
-        }
-
-        ALL_RESULTS, ALL_RETENTION = process_all_segments_spectral(
-            RAW_CLEAN, SUJETO, _filtered_segments,
-        )
-
-        _n_win = len({(r["seg_type"], r["seg_idx"], r["win_idx"]) for r in ALL_RESULTS})
-        print(f"\n  Total: {_n_win} windows, {len(ALL_RESULTS)} result rows\n")
-
-
-#%%
-# =============================================================================
-# CELL 8 — EXCEL EXPORT (per-subject)
-# =============================================================================
-# Exports the spectral power results for this subject.
-# Only includes segments that were inspected and cleaned.
-# =============================================================================
-
-print("=" * 70)
-print(f"  Subject {SUJETO} -- Exporting per-subject Excel")
-print("=" * 70)
-
-df_long = pd.DataFrame(ALL_RESULTS)
-
-if df_long.empty:
-    print("\n  !! No spectral results to export.  Check previous cells for errors.\n")
-else:
-    # --- Segment-level averages --------------------------------------------
-    df_seg_avg = compute_segment_averages(df_long)
-
-    # --- Region-level averages ---------------------------------------------
-    df_region_avg = compute_region_averages(df_seg_avg)
-
-    # --- QC tables ---------------------------------------------------------
-    df_qc_mk  = build_qc_markers_df(ALL_SEGMENTS)
-    df_qc_bad = build_qc_bad_channels_df(ALL_BAD_CHANNELS)
-    df_qc_ica = build_qc_ica_df(ALL_ICA_INFO)
-    df_qc_ret = build_qc_retention_df(ALL_RETENTION if "ALL_RETENTION" in dir() else [])
-
-    # --- Per-subject Excel -------------------------------------------------
-    _excel_path = EXCEL_DIR / f"subject_{SUJETO}_eeg_bandpower.xlsx"
-    export_excel(
-        df_long, df_seg_avg, df_region_avg,
-        df_qc_mk, df_qc_bad, df_qc_ica,
-        _excel_path,
-        df_qc_retention=df_qc_ret,
-    )
-
-    print(f"\n  Rows exported : {len(df_long):,}")
-    print(f"  Bands         : {df_long['band'].nunique()}")
-    print(f"  Channels      : {df_long['channel'].nunique()}")
-    print(f"  Segments      : {list(df_long['seg_type'].unique())}")
-    print(f"\n  Excel -> {_excel_path}")
-
-print("\n  Subject processing finished.\n")
-
-
-#%%
-# =============================================================================
-# CELL 9 — AGGREGATE ALL SUBJECTS (run after processing all subjects)
-# =============================================================================
-# Run this cell AFTER you have processed all subjects individually.
-# =============================================================================
-
-print("=" * 70)
-print("  Aggregating all subjects into global Excel")
-print("=" * 70 + "\n")
-
-aggregate_subject_excels(EXCEL_DIR)
-
-print("\n  Done.\n")
-
-
-#%%
-# =============================================================================
-# CELL 10 — TOPOGRAPHIC MAPS (per-subject visualization)
-# =============================================================================
-# Creates topographic maps showing the spatial distribution of spectral power
-# for each frequency band and segment type.
+# Spectral power, Excel export, aggregation, and topomaps were moved out of
+# this script so that `eeg_preprocessing_pipeline.py` remains focused on data
+# cleaning only.
 #
-# Two visualization options:
-#   1. Separate figures per segment (detailed view)
-#   2. Single comparison grid (all segments × all bands)
-#
-# Run this AFTER Cell 8 (Excel export) since it uses the segment-averaged data.
+# Use `eeg_spectral_analysis.py` after Cell 6 to analyse the cleaned FIF files
+# saved in `output/clean_data/` together with the segment JSON files in
+# `output/qc/`.
 # =============================================================================
 
-print("=" * 70)
-print(f"  Subject {SUJETO} -- Topographic Maps")
-print("=" * 70)
-
-# Check if we have the segment-averaged data
-if "df_seg_avg" not in dir() or df_seg_avg is None or df_seg_avg.empty:
-    # Try to load from the Excel file
-    _excel_path = EXCEL_DIR / f"subject_{SUJETO}_eeg_bandpower.xlsx"
-    if _excel_path.exists():
-        print(f"  Loading data from {_excel_path.name}...")
-        df_seg_avg = pd.read_excel(_excel_path, sheet_name="bandpower_segment_avg")
-    else:
-        print(f"  !! Excel file not found: {_excel_path}")
-        print("  !! Run Cell 8 first to generate the data.")
-        df_seg_avg = pd.DataFrame()
-
-if not df_seg_avg.empty:
-    # Diagnostic: show what segments are in the data
-    _found_segs = sorted(df_seg_avg[
-        df_seg_avg["subject"].astype(str) == str(SUJETO)
-    ]["seg_type"].unique())
-    print(f"  Segments in data: {_found_segs}")
-    if len(_found_segs) == 0:
-        print(f"  !! No segments found for subject {SUJETO} in df_seg_avg.")
-        print(f"     Unique subjects in data: {sorted(df_seg_avg['subject'].unique())}")
-        print(f"     Make sure Cell 7 & 8 ran with all segments inspected.")
-    else:
-        _topo_dir = subject_qc_dir(SUJETO)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-
-            # 1) Individual segment topomaps (absolute power, per-segment colour scale)
-            print("\n  1. Individual segment topomaps (absolute power)...")
-            plot_subject_topomaps(df_seg_avg, SUJETO, save_dir=_topo_dir,
-                                  power_type="abs_power_mean")
-
-            # 2) Comparison grid — absolute power (robust percentile scaling)
-            print("\n  2. Comparison grid — absolute power (robust colour scale)...")
-            plot_subject_topomaps_comparison(df_seg_avg, SUJETO, save_dir=_topo_dir,
-                                             power_type="abs_power_mean")
-
-            # 3) Comparison grid — relative power (normalised within each window)
-            print("\n  3. Comparison grid — relative power...")
-            plot_subject_topomaps_comparison(df_seg_avg, SUJETO, save_dir=_topo_dir,
-                                             power_type="rel_power_mean")
-
-        print(f"\n  Topomaps saved to: {_topo_dir}")
-else:
-    print("  !! No data available for topomaps.")
-
-print("\n  Done.\n")
-
-# %%
