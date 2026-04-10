@@ -58,6 +58,8 @@ def main(
     print(f"\n  [Viewer] Segment: {tmin_clamped:.1f} – {tmax_clamped:.1f} s")
     print("           Click channel name to toggle BAD")
     print("           Press 'a' then click-drag to annotate BAD time segments")
+    print("           NOTE: to DELETE a BAD mark, zoom in on it first,")
+    print("                 then right-click directly on the coloured region.")
     print("           Close window when done.\n")
 
     fig = segment.plot(
@@ -91,12 +93,23 @@ def main(
             "description": ann["description"],
         })
 
+    # NEW — collect full final BAD state in segment (before vs after handled by pipeline)
+    final_annotations = []
+    for ann in segment.annotations:
+        if ann["description"].upper().startswith("BAD"):
+            final_annotations.append({
+                "onset":       float(ann["onset"]),
+                "duration":    float(ann["duration"]),
+                "description": str(ann["description"]),
+            })
+
     # Write output JSON
     result = {
-        "segment_tmin": tmin_clamped,
-        "segment_tmax": tmax_clamped,
+        "segment_tmin":      tmin_clamped,
+        "segment_tmax":      tmax_clamped,
         "bad_channels_added": new_bads,
-        "annotations_added": new_annotations,
+        "annotations_added": new_annotations,   # kept for backward compat
+        "annotations_final": final_annotations, # NEW: full state after user edits
     }
 
     if output_json:
